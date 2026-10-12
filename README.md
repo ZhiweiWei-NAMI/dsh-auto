@@ -49,4 +49,8 @@ Magpie 的 Auto 配置指定 `decider: jev-1.13-free` 和 Console 密钥文件�
 
 ## 验证
 
-真实小任务已验证工具执行、文件修改和单元测试。Auto 路径使用过两个原生调查子代理并收回结果。SWE-bench Verified 的三组结果由 [magpie-auto](https://github.com/ZhiweiWei-NAMI/magpie-auto/tree/feature/auto-workspace/experiments/jev-cache-20261012) 保存；结果完成后再据实判断收益。
+原生 dsh 已成功安装 v0.2.2，并完成真实编程任务与测试。另一个小任务实际启动两个原生调查子代理、收回完整结果并产出通过测试的代码。
+
+固定十二题 SWE-bench Verified 已完成三组官方判分：Auto 解决 6/12，单代理与原生可选子代理各解决 8/12。正式 Auto 运行启动三个调查子代理，一位完成，两位失败；原生可选组自行选择了全部单代理执行。71 次 Jev 请求均成功。实际补丁、主代理/子代理/Jev 用量和缓存统计见 [实验记录](https://github.com/ZhiweiWei-NAMI/magpie-auto/tree/feature/auto-workspace/experiments/jev-cache-20261012)。
+
+三组全部解决的五题中，Auto 比单代理少 12.7% 未命中 token，但输出多 27.9%、耗时多 6.7%，未证明整体节省。正式任务的压力决策全部保留历史，没有实际上下文替换；完整来源分批选择已有短回归，原生事务中应用真实 Jev 筛选的效果仍未验证。当前 WorkBuddy 服务仍轮换账号，缓存条件也限制了结论。
