@@ -4,6 +4,7 @@ import z from '@deepseek-ai/schemastery';
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { toolPairingBalancedBefore, toolPairingBalancedAfter } from '@deepseek-ai/dsh-compaction';
+import { pressureDecision } from './decisions.js';
 
 export const name = 'magpie-auto';
 export const inject = ['llm', 'tokenMeter', 'sessions', 'subagents', 'tools', 'agents'];
@@ -40,7 +41,7 @@ export function apply(ctx, config) {
     });
     const result = await response.json();
     record({kind:'jev', session:agent.session.id, trigger:request.trigger, httpStatus:response.status, wallMs:performance.now()-started, ...result});
-    if (!response.ok) throw new Error(`Magpie Jev decision failed (HTTP ${response.status}): ${result.error ?? JSON.stringify(result)}`);
+    if (!response.ok) throw new Error(`Magpie Jev decision failed (HTTP ${response.status}): ${typeof result.error === 'string' ? result.error : JSON.stringify(result.error ?? result)}`);
     return result;
   }
 
@@ -53,8 +54,12 @@ export function apply(ctx, config) {
     if (state.children + state.pending.size >= config.maxChildren || state.active + state.pending.size >= config.maxConcurrent) return 'Task subagent resource limit reached.';
     state.pending.add(execution.callId);
   });
-  ctx.on('tools/result', execution => {
-    if (delegation.has(execution.name) && execution.agent) budget(rootOf(execution.agent)).pending.delete(execution.callId);
+  ctx.on('tools/result', (execution,result) => {
+    if (delegation.has(execution.name) && execution.agent) {
+      budget(rootOf(execution.agent)).pending.delete(execution.callId);
+      if (config.mode === 'native') record({kind:'native_child_tool_result',parent:execution.agent.session.id,
+        callId:execution.callId,tool:execution.name,isError:result.isError,value:result.value,error:result.error});
+    }
   });
   ctx.on('subagent/start', info => {
     const child = ctx.agents.get(info.id);
@@ -133,10 +138,10 @@ export function apply(ctx, config) {
           const history = region.map(x => ({id:'event_'+x.seq, kind:x.message.role, text:JSON.stringify(x.message), required:x.message.source.kind === 'user'}));
           const usage = agent.session.snapshotEvents().toReversed().find(e => e.data?.usage !== undefined)?.data.usage;
           const task = roots.get(agent.session.id) ?? region.filter(x => x.message.source.kind === 'user').map(x => text(x.message)).join('\n');
-          const decision = await decide(agent, {task, trigger:'pressure', history,
-            observation:{nativeUsage:usage, estimatedContextTokens:measured.totalTokens},
-            actions:{keep:'Keep current history unchanged to preserve its warmed prefix cache when the context still fits.',
-                     select:'Omit clearly irrelevant old evidence only when the reduction justifies losing cache reuse from the first replaced history token. Retain all explicit instructions and complete useful results.'}}, signal);
+          const decision = await pressureDecision(request => decide(agent,request,signal),task,history,
+            {nativeUsage:usage, estimatedContextTokens:measured.totalTokens,contextWindow:agent.session.requestContext()?.contextWindow},
+            {keep:'Keep current history unchanged to preserve its warmed prefix cache when the context still fits.',
+             select:'Omit clearly irrelevant old evidence only when the reduction justifies losing cache reuse from the first replaced history token. Retain all explicit instructions and complete useful results.'});
           const selected = new Set(decision.selectedIds);
           const summary = region.filter(x => selected.has('event_'+x.seq)).map(x => ({type:'text',text:render(x.message)}));
           const shadowedTokens = measured.nodes.slice(start,end+1).reduce((sum,node) => sum+node.tokens,0);
