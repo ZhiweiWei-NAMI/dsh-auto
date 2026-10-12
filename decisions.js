@@ -3,6 +3,12 @@
 export const STATE_BYTES = 24000;
 const size = value => Buffer.byteLength(JSON.stringify(value));
 
+export function extendTask(task,messages) {
+  const requests=messages.filter(message=>message.source.kind==='user')
+    .map(message=>message.content.filter(block=>block.type==='text').map(block=>block.text).join('\n'));
+  return [task,...requests].filter(Boolean).join('\n\n');
+}
+
 export function selectionBatches(task, history) {
   const base = {task, trigger:'selection', history:[]};
   if (size(base) + 1000 >= STATE_BYTES) throw new Error('The complete task exceeds the Jev decision state budget.');

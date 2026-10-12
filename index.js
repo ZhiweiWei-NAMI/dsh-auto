@@ -4,7 +4,7 @@ import z from '@deepseek-ai/schemastery';
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { toolPairingBalancedBefore, toolPairingBalancedAfter } from '@deepseek-ai/dsh-compaction';
-import { pressureDecision } from './decisions.js';
+import { pressureDecision,extendTask } from './decisions.js';
 
 export const name = 'magpie-auto';
 export const inject = ['llm', 'tokenMeter', 'sessions', 'subagents', 'tools', 'agents'];
@@ -91,6 +91,8 @@ export function apply(ctx, config) {
   ctx.on('agent/pre-step', async (payload, next) => {
     const {agent, signal, messages} = payload;
     const isChild = agent.session.header.parentSession !== undefined;
+    if (roots.has(agent.session.id)) roots.set(agent.session.id,extendTask(roots.get(agent.session.id),messages));
+    else if (isChild) roots.set(agent.session.id,messages.map(text).join('\n'));
     if (!isChild && !roots.has(agent.session.id)) {
       const task = messages.map(text).join('\n');
       roots.set(agent.session.id, task);

@@ -1,6 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {STATE_BYTES,selectionBatches,pressureDecision} from '../decisions.js';
+import {STATE_BYTES,selectionBatches,pressureDecision,extendTask} from '../decisions.js';
+
+test('continued user requirements preserve complete tails and update the decision task',()=>{
+  const original='Implement the issue while keeping its public API.';
+  const request='Detailed constraint. '.repeat(200)+'Keep the Unicode suffix.';
+  const updated=extendTask(original,[{source:{kind:'user'},content:[{type:'text',text:request}]},
+    {source:{kind:'plugin'},content:[{type:'text',text:'A transient plugin notice.'}]}]);
+  assert.ok(updated.startsWith(original));assert.ok(updated.endsWith('Keep the Unicode suffix.'));
+  assert.ok(updated.includes(request));assert.ok(!updated.includes('transient plugin'));
+});
 
 test('all oversized Unicode source content is judged and a useful tail keeps the whole source',async()=>{
   const full = '实验记录😃\n'.repeat(14000)+'TAIL_REQUIREMENT';
