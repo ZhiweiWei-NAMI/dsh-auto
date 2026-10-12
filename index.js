@@ -115,8 +115,8 @@ export function apply(ctx, config) {
               runs.push(run);
             }
             const outcomes = await Promise.all(runs.map(run => run.result));
+            outcomes.forEach((outcome,i) => record({kind:'child_collected',parent:agent.session.id,role:roles[i],stopReason:outcome.stopReason}));
             const notes = outcomes.map((outcome, i) => {
-              record({kind:'child_collected', parent:agent.session.id, role:roles[i], stopReason:outcome.stopReason});
               if (outcome.stopReason !== 'completed') throw new Error(`Native child failed: ${JSON.stringify(outcome.stopReason)}`);
               return roles[i]+'\n'+outcome.output.filter(b => b.type === 'text').map(b => b.text).join('\n');
             });
