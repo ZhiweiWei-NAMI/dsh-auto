@@ -5,9 +5,9 @@ const score = (instructions, criteria) => ({type:'score',instructions,criteria})
 
 export function delegationQuestions(profiles, children) {
   const questions = {
-    independent:{type:'noul',instructions:'Can the proposed subtask proceed using available inputs without waiting for unfinished parent work? Assess dependencies only.'},
-    useful:score('Does the proposed subtask address unfinished work in the current goal? Assess usefulness only.',
-      ['It duplicates completed work or is unrelated.', 'Its contribution is uncertain or mostly repeats current work.', 'It has a concrete unfinished deliverable.']),
+    independent:{type:'noul',instructions:'Can the proposed subtask proceed using available inputs without waiting for unfinished work owned by the parent or an active child? Assess dependencies only.'},
+    useful:score('Does the proposed subtask add an unfinished deliverable that is neither completed nor already assigned to an active child? Judge incremental contribution using the current evidence and child responsibilities.',
+      ['It duplicates completed or active work, or is unrelated.', 'Its contribution is uncertain or mostly repeats current work.', 'It has a concrete unfinished, unassigned deliverable.']),
   };
   for (const [i,profile] of profiles.entries()) questions['fit_'+i]=score(
     `How suitable is configured profile ${profile.id} for the proposed subtask? Use its stated capability and actual model/effort, not the order of candidates.`,

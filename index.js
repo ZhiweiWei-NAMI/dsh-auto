@@ -8,7 +8,7 @@ import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic';
 import {createUserMessage} from '@deepseek-ai/dsh-llm';
 import {validateJsonSchemaValue,ToolArgsError} from '@deepseek-ai/dsh-tools';
 import {toolPairingBalancedBefore,toolPairingBalancedAfter} from '@deepseek-ai/dsh-compaction';
-import {scoreContext,selectionBatches,extendTask} from './decisions.js';
+import {scoreContext,selectionBatches,extendTask,STATE_BYTES} from './decisions.js';
 import {delegationQuestions,selectDelegation} from './routing.js';
 
 export const name='magpie-auto';
@@ -29,6 +29,14 @@ export const Config=z.object({
 const delegation=new Set(['subagent','subagent_fork']);
 const text=m=>m.content.filter(b=>b.type==='text').map(b=>b.text).join('\n');
 const note=value=>createUserMessage({content:[{type:'text',text:value}],source:{kind:'plugin',plugin:'dsh-auto'}});
+const boundedEvidence=units=>{
+  const currentEvidence=[],recentEvidenceOutsideBudget=[];
+  for(const unit of units) {
+    if(Buffer.byteLength(JSON.stringify([...currentEvidence,unit]))<=6000)currentEvidence.push(unit);
+    else recentEvidenceOutsideBudget.push(unit.id);
+  }
+  return {currentEvidence,recentEvidenceOutsideBudget};
+};
 
 export function apply(ctx,config) {
   const roots=new Map(),tasks=new Map(),budgets=new Map(),assignments=new Map();
@@ -154,14 +162,23 @@ export function apply(ctx,config) {
     const parent=exec.agent,state=roots.get(parent.session.id),resources=budget(parent.session.id);
     const listing=await ctx.subagents.listChildren(parent.session.id,exec.signal);
     const persistedAssignments=(await storage()).table('assignments');
-    const children=listing.filter(x=>x.kind==='child' && x.mode==='continuable' && !active.has(x.id)).map(child=>{
+    const knownChildren=listing.filter(x=>x.kind==='child').map(child=>{
       const assignment=assignments.get(child.id)??persistedAssignments.get(child.id);
-      return {...child,...assignment?{assignment:assignment.proposal,profile:assignment.profile.id}:{}};
+      const outcome=settled.get(child.id);
+      return {...child,...assignment?{assignment:assignment.proposal,profile:assignment.profile.id}:{},
+        ...outcome?{stopReason:outcome.stopReason,lastAssistantMessage:outcome.lastAssistantMessage}:{}};
     });
+    const children=knownChildren.filter(x=>x.mode==='continuable' && !active.has(x.id));
+    const recent=[...parent.session.surface.nodes].slice(-4).flatMap(seq=>{
+      const message=parent.session.deriveEventMessage(parent.session.eventAt(seq));
+      return message?message.content.filter(block=>block.type!=='reasoning').map((block,i)=>({id:'event_'+seq+'_evidence_'+i,kind:message.role+'/'+block.type,text:JSON.stringify(block)})):[];
+    }).slice(-3);
     const request={task:tasks.get(parent.session.id),trigger:'delegation',history:[],
-      observation:{proposal:args.prompt,description:args.description,profiles:state.profiles,children,
+      observation:{proposal:args.prompt,description:args.description,profiles:state.profiles,children:knownChildren,...boundedEvidence(recent),
         childRequestsRemaining:config.maxChildRequests-resources.childRequests,childrenRemaining:config.maxChildren-resources.children.size},
       questions:delegationQuestions(state.profiles,children)};
+    const {questions,...decisionState}=request;
+    if(Buffer.byteLength(JSON.stringify(decisionState))>STATE_BYTES)throw new Error('The complete delegation state exceeds the Jev budget; narrow the proposed subtask or continue in the parent. No source was truncated.');
     const decision=await decide(parent,request,exec.signal);
     const selected=selectDelegation(decision.answers,state.profiles,children,state.policy,{canCreate:resources.children.size<config.maxChildren});
     record({kind:'delegation_decision',session:parent.session.id,callId:exec.callId,...selected});
@@ -206,7 +223,6 @@ export function apply(ctx,config) {
       const original=ctx.tools.get(name,agent);
       if (!original) throw new Error('Required native delegation tool is unavailable: '+name);
       agent.ctx.tools.register({...original,
-        description:original.description+' Jev evaluates the proposed assignment and selects a configured profile or an existing child conversation. A declined proposal stays with the parent.',
         async execute(args,exec) {
           const violations=validateJsonSchemaValue(original.parameters,args,'');
           if (violations.length) throw new ToolArgsError(violations);
@@ -346,12 +362,7 @@ export function apply(ctx,config) {
     const history=units(region);
     const recent=units(nodes.slice(end+1).map(seq=>({seq,message:agent.session.deriveEventMessage(agent.session.eventAt(seq))})).filter(x=>x.message!==null))
       .filter(x=>!x.kind.endsWith('/reasoning')).slice(-3);
-    const currentEvidence=[],withheld=[];
-    for(const unit of recent) {
-      if(Buffer.byteLength(JSON.stringify([...currentEvidence,unit]))<=6000)currentEvidence.push(unit);
-      else withheld.push(unit.id);
-    }
-    const observation={contextPressure:pressure,nativeEstimate:measured.totalTokens,currentEvidence,recentEvidenceOutsideBudget:withheld};
+    const observation={contextPressure:pressure,nativeEstimate:measured.totalTokens,...boundedEvidence(recent)};
     const state=budget(rootOf(agent));
     const batches=selectionBatches(tasks.get(id),history,observation);
     if(state.decisions+batches.length>config.maxDecisions){
