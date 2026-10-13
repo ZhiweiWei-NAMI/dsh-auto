@@ -1,9 +1,14 @@
 {
   "name": "dsh-auto",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "peerDependencies": {
     "@deepseek-ai/dsh-compaction-basic": "^0.1.5-rc.1",
     "@deepseek-ai/dsh-llm": "^0.1.5-rc.1",

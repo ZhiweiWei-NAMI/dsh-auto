@@ -1,0 +1,6 @@
+# Own the native compaction service only while Auto is mounted.
+- id: compaction-basic
+  disabled: true
+- insert:
+    - id: magpie-auto
+      name: dsh-auto

@@ -1,0 +1,5 @@
+# Apply at startup with --patch; restore the native service together.
+- id: magpie-auto
+  disabled: true
+- id: compaction-basic
+  disabled: false

@@ -6,35 +6,47 @@ Magpie Auto 的 dsh 客户端插件。Magpie 调用真正的 `jev-1.13-free`，�
 
 ## 启用
 
-安装到要使用的 dsh profile：
+服务器已安装到本机 `$DSH_HOME/profiles/auto`，直接选择：
 
 ```bash
-dsh plugin --profile headless add github:ZhiweiWei-NAMI/dsh-auto
+# 启用 Auto，执行当前目录的任务
+dsh --profile auto "你的编程任务"
+
+# 同一模型连接，关闭 Auto，使用原生 dsh
+dsh --profile auto --patch "$DSH_HOME/profiles/auto/node_modules/dsh-auto/off.patch.yml" "你的编程任务"
 ```
 
-在 `$DSH_HOME/cordis.patch.yml` 加入以下配置。插件使用原生压缩事务，所以 Auto 模式下关闭原有自动压缩插件，避免同时修改同一段历史。
+原有 `web`、`headless` 等 profile 保持原配置。`auto` 使用本机 dsh 的会话、工具和存储，不另设运行时或 `DSH_HOME`。以上开关在启动时选择，长任务中不要切换。
+
+其他机器安装到一个新 profile（首次初始化执行一次）：
+
+```bash
+dsh --profile auto --from-default-profile headless --dump-config >/dev/null
+dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto#v0.3.1
+```
+
+v0.3.1 声明了原生 `dsh.bundle`，安装后自动挂载插件并停用 `compaction-basic`，无需手写 `insert`。卸载 `dsh plugin --profile auto remove dsh-auto` 会移除该层并恢复原生压缩。旧版手工添加的 `magpie-auto` 和压缩开关应先从用户 patch 中移除，避免重复挂载。
+
+执行模型连接仍需配置。服务器 `auto/cordis.patch.yml` 将 `settings` 指向同目录的 `settings.yaml`，其中选择 `deepseek-official` 适配器、`dsh-workbuddy/deepseek-v4.1-flash` 模型和 `http://127.0.0.1:3435/v1` 网关。该 profile 的 `.credentials.yaml` 仅存本机网关所需的非秘密占位值，不含上游账号或 Console 密钥。
+
+需要覆盖插件限制时，在 **profile 自己的** `$DSH_HOME/profiles/auto/cordis.patch.yml` 增加：
 
 ```yaml
-- id: compaction-basic
-  disabled: true
-- insert:
-    - id: magpie-auto
-      name: dsh-auto
-      config:
-        mode: auto
-        endpoint: http://127.0.0.1:3435/v1/auto/decide
-        maxChildren: 2
-        maxConcurrent: 2
-        maxChildRequests: 16
-        maxChildTurnRequests: 8
-        maxDecisions: 12
-        pressureTokens: 64000
-        retainTokens: 8000
+- id: magpie-auto
+  config:
+    endpoint: http://127.0.0.1:3435/v1/auto/decide
+    maxChildren: 2
+    maxConcurrent: 2
+    maxChildRequests: 16
+    maxChildTurnRequests: 8
+    maxDecisions: 12
+    pressureTokens: 64000
+    retainTokens: 8000
 ```
 
 Magpie 的 Auto 配置指定 `decider: jev-1.13-free` 和 Console 密钥文件的绝对路径。密钥只由服务器读取，dsh 不接收 Console 密钥。执行模型连接仍使用已有 Magpie 网关和 dsh-workbuddy 服务。
 
-模型连接、默认执行模型位于 `$DSH_HOME/settings.yaml`；插件启用及限制位于 `$DSH_HOME/cordis.patch.yml`。`recordFile` 可指定一个已存在、可写目录中的 JSONL 文件，记录 Jev 用量和原生子代理生命周期。
+本机 Auto 的模型连接和默认执行模型位于 `$DSH_HOME/profiles/auto/settings.yaml`；插件限制位于同目录 `cordis.patch.yml`。不要写进 home 级 patch，以免影响其他 profile。`recordFile` 可指定一个已存在、可写目录中的 JSONL 文件，记录模型用量和原生子代理生命周期。
 
 ## 行为
 
@@ -52,7 +64,9 @@ Magpie 的 Auto 配置指定 `decider: jev-1.13-free` 和 Console 密钥文件�
 
 ## 关闭
 
-删除 `magpie-auto` 插件条目并重新启用 `compaction-basic`，恢复原生 dsh 行为。只关闭 Jev、保留任务子代理上限时，可以把 `mode` 改为 `native`，同时把 `compaction-basic.disabled` 改为 `false`。
+使用上面的 `off.patch.yml`，同时卸载本次进程中的 Auto 插件并恢复 `compaction-basic`；关闭后不调用 Jev，也不施加插件的子代理预算。普通 `headless` / `web` profile 原本就未启用本插件。
+
+只关闭 Jev、保留任务子代理上限时，可以把 `mode` 改为 `native`，同时把 `compaction-basic.disabled` 改为 `false`。
 
 `mode: single` 禁止原生子代理调用，供单代理对照实验使用。单代理模式同样需要启用原生 `compaction-basic`。
 
