@@ -52,6 +52,8 @@ Magpie 的 Auto 配置指定 `decider: jev-1.13-free` 和 Console 密钥文件�
 
 执行模型通过原生 `subagent` 或 `subagent_fork` 提出具体子任务；Jev 分别判断未完成价值、依赖、配置匹配和会话延续性。插件据此让主代理继续、创建原生 continuable 子代理，或通过 `sendMessage` 延续已有子代理。默认后台执行，主代理可以同时工作；显式前台请求才等待。Jev 是评分/选择模型，不生成自由文本任务计划。
 
+决策证据排除尚未执行的工具调用，并明确当前提案尚未分配。Jev 拒绝后，主代理应继续工作；取得新的工具结果或用户/子代理消息前，改写提案不会重复调用 Jev。
+
 在 Magpie 控制台的策略输入框，可以输入例如“自动决策，优先正确性和缓存，偏好实现代理，只在独立子任务有明确收益时协作”。Magpie 用一次真实 Jev 调用生成模式和初始偏好；相同指令与路由再次保存不重复调用。新会话读取并固定策略，已有会话不随全局编辑漂移。策略存入 dsh 原生 storage domain：`$DSH_HOME/storages/dsh_auto/`；模型历史仍由原生 session 管理，不向事件日志写入 SDK 不认识的事件类型。
 
 `routes` 是允许使用的角色、模型和 effort。插件用 dsh 的连接准备接口检查候选配置；主代理默认模型仍由 `settings.yaml` 设置。当前服务器只实测 `deepseek-v4.1-flash` + `high`，不能据此声称跨模型路由提高了质量。策略权重是用户偏好，不是模型成功概率。
@@ -74,10 +76,18 @@ Magpie 的 Auto 配置指定 `decider: jev-1.13-free` 和 Console 密钥文件�
 
 ## 验证
 
-v0.3.0 已通过原生 dsh 从 GitHub 安装，并在真实编程探针中由 Jev 选择复用同一个子代理，完成两次激活与结果回收。第二次激活首请求保持系统提示、工具和历史前缀稳定，实测输入 9,607、命中 6,784、未命中 2,823 token。此次共 5 次 Jev 判断，包含被拒绝后重新提出的候选；不能把这部分开销隐去。另一个刻意降低压力阈值的探针完成两次真实 Jev 上下文替换并通过代码测试。这证明链路可运行，不证明性能提升；失败的开发探针也保留在[修订记录](https://github.com/ZhiweiWei-NAMI/magpie-auto/tree/feature/auto-workspace/experiments/jev-routing-revision)。
+v0.3.1 已从 GitHub 安装到本机原生 `auto` profile，完成真实代码修改、子代理执行、结果回收和独立判题。配置开关、关闭后的代码产物也通过验证，已有默认配置保持不变。[安装验证记录](validation/local-install-20261013.json) 包含实际用量、首次/后续请求和未成功的开发探针。这是功能验证，不是性能 benchmark。
 
-固定十二题 SWE-bench Verified 已完成三组官方判分：Auto 解决 6/12，单代理与原生可选子代理各解决 8/12。正式 Auto 运行启动三个调查子代理，一位完成，两位失败；原生可选组自行选择了全部单代理执行。71 次 Jev 请求均成功。实际补丁、主代理/子代理/Jev 用量和缓存统计见 [实验记录](https://github.com/ZhiweiWei-NAMI/magpie-auto/tree/feature/auto-workspace/experiments/jev-cache-20261012)。
+| 指标 | 本机安装后的子代理流程 |
+| --- | --- |
+| M1 正确性 | 插件短回归 9/9；最终代码测试 3/3，测试文件未改动 |
+| M2 耗时 | 49.676 秒 |
+| M3 用量 | DeepSeek 输入 138,403 / 输出 4,628；Jev 输入 2,375 / 输出 66 |
+| M4 缓存 | DeepSeek 命中 24,448 / 未命中 113,955；写入及 Jev 缓存字段未提供 |
+| M5 决策开销 | Jev 1 次、0.640 秒；DeepSeek 共 16 次 |
+| M6 抖动 | 此次未做重复性能测量，不能估计 |
+| M7 协作 | 1 个原生子代理完成并回收；主代理 10 次、子代理 6 次执行模型调用 |
 
-上述十二题使用旧 v0.2.2；三组全部解决的五题中，Auto 比单代理少 12.7% 未命中 token，但输出多 27.9%、耗时多 6.7%，未证明整体节省。旧正式任务未发生上下文替换。v0.3.0 的两题诊断另列，不覆盖旧结果，不作为无偏的新 benchmark。当前 WorkBuddy 服务仍轮换账号，缓存条件限制了结论。
+修复前的补测发生 12 次拒绝且没有创建子代理；修复后同一职责流程由 Jev 选择创建并成功回收，拒绝记录没有删除。另一次安装失败后误用旧版本的探针被中断，也单列保留。没有据此宣称整体性能提高；账单字段未提供，不计算费用。
 
-本轮两题三组官方解决率均为 1/2；三轮短任务每组 3/3，任务级 Jev 均为零。短任务耗时中位数 A/B/C 为 16.55 / 16.95 / 18.16 秒，样本不足以宣称显著优势。系统和工具稳定仍不能保证命中：同一会话切到新账号常仅命中 0–384 token，回到旧账号时命中量接近它先前接收的输入。共享服务未重启，不能把缓存抖动说成已经全部解决。
+此前 v0.3.0 已验证同一原生子代理的两次激活及 Jev 上下文替换，见[修订记录](https://github.com/ZhiweiWei-NAMI/magpie-auto/tree/feature/auto-workspace/experiments/jev-routing-revision)。旧 v0.2.2 的十二题 SWE-bench Verified 官方解决率为 Auto 6/12、单代理与原生可选协作各 8/12，见[完整实验](https://github.com/ZhiweiWei-NAMI/magpie-auto/tree/feature/auto-workspace/experiments/jev-cache-20261012)。未证明 Auto 普遍优于原生 dsh；共享 WorkBuddy 仍轮换账号，缓存抖动尚未全部解决。
