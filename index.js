@@ -1,167 +1,383 @@
 import fs from 'node:fs';
-import { performance } from 'node:perf_hooks';
+import {randomUUID} from 'node:crypto';
+import {performance} from 'node:perf_hooks';
 import z from '@deepseek-ai/schemastery';
+import {z as schema} from 'zod';
+import {defineDomain,domainTable} from '@deepseek-ai/dsh-storage-domain';
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic';
-import { createUserMessage } from '@deepseek-ai/dsh-llm';
-import { toolPairingBalancedBefore, toolPairingBalancedAfter } from '@deepseek-ai/dsh-compaction';
-import { pressureDecision,extendTask } from './decisions.js';
+import {createUserMessage} from '@deepseek-ai/dsh-llm';
+import {validateJsonSchemaValue,ToolArgsError} from '@deepseek-ai/dsh-tools';
+import {toolPairingBalancedBefore,toolPairingBalancedAfter} from '@deepseek-ai/dsh-compaction';
+import {scoreContext,selectionBatches,extendTask} from './decisions.js';
+import {delegationQuestions,selectDelegation} from './routing.js';
 
-export const name = 'magpie-auto';
-export const inject = ['llm', 'tokenMeter', 'sessions', 'subagents', 'tools', 'agents'];
-export const Config = z.object({
-  mode: z.union(['auto', 'single', 'native']).default('auto'),
-  endpoint: z.string().default('http://127.0.0.1:3435/v1/auto/decide'),
-  maxChildren: z.number().step(1).min(0).default(2),
-  maxConcurrent: z.number().step(1).min(1).default(2),
-  pressureTokens: z.number().min(1024).default(24000),
-  retainTokens: z.number().min(1024).default(8000),
-  recordFile: z.string(),
+export const name='magpie-auto';
+export const inject=['llm','tokenMeter','sessions','subagents','tools','agents','storageDomain'];
+export const Config=z.object({
+  mode:z.union(['auto','single','native']).default('auto'),
+  endpoint:z.string().default('http://127.0.0.1:3435/v1/auto/decide'),
+  maxChildren:z.number().step(1).min(0).default(2),
+  maxConcurrent:z.number().step(1).min(1).default(2),
+  maxChildRequests:z.number().step(1).min(1).default(16),
+  maxChildTurnRequests:z.number().step(1).min(2).default(8),
+  maxDecisions:z.number().step(1).min(1).default(12),
+  pressureTokens:z.number().min(1024).default(64000),
+  retainTokens:z.number().min(1024).default(8000),
+  nativeThresholdRatio:z.number().min(0.01).max(1).default(0.8),
+  recordFile:z.string(),
 });
+const delegation=new Set(['subagent','subagent_fork']);
+const text=m=>m.content.filter(b=>b.type==='text').map(b=>b.text).join('\n');
+const note=value=>createUserMessage({content:[{type:'text',text:value}],source:{kind:'plugin',plugin:'dsh-auto'}});
 
-const delegation = new Set(['subagent', 'subagent_fork']);
-const text = message => message.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-
-// Extends dsh's compaction transaction; adds no agent execution runtime.
-export function apply(ctx, config) {
-  const roots = new Map();
-  const budgets = new Map(), childParents = new Map();
-  const rootOf = agent => agent.session.header.parentSession ?? agent.session.id;
-  const budget = id => {
-    if (!budgets.has(id)) budgets.set(id, {children:0, active:0, pending:new Set()});
+export function apply(ctx,config) {
+  const roots=new Map(),tasks=new Map(),budgets=new Map(),assignments=new Map();
+  const active=new Map(),settled=new Map(),waiters=new Map(),prepared=new Map(),nextPressure=new Map();
+  const pressureAnchors=new Map();
+  const turnRequests=new Map(),turnIds=new Map(),wrapped=new WeakSet(),collected=new Set(),reports=new Map(),childMessaging=new WeakSet();
+  const rootOf=agent=>agent.session.header.parentSession ?? agent.session.id;
+  const budget=id=>{
+    if (!budgets.has(id)) budgets.set(id,{children:new Set(),pending:new Set(),childRequests:0,decisions:0});
     return budgets.get(id);
   };
-  const record = value => {
-    if (config.recordFile) fs.appendFileSync(config.recordFile, JSON.stringify({at: new Date().toISOString(), ...value})+'\n', {mode: 0o600});
+  const record=value=>{
+    if (config.recordFile) fs.appendFileSync(config.recordFile,JSON.stringify({at:new Date().toISOString(),...value})+'\n',{mode:0o600});
   };
-  async function decide(agent, request, signal) {
-    const started = performance.now();
-    const response = await fetch(config.endpoint, {
-      method: 'POST', headers: {'Content-Type':'application/json', 'Authorization':'Bearer magpie', 'User-Agent':'dsh-auto'},
-      body: JSON.stringify({sessionId: agent.session.id, ...request}), signal,
-    });
-    const result = await response.json();
-    record({kind:'jev', session:agent.session.id, trigger:request.trigger, httpStatus:response.status, wallMs:performance.now()-started, ...result});
-    if (!response.ok) throw new Error(`Magpie Jev decision failed (HTTP ${response.status}): ${typeof result.error === 'string' ? result.error : JSON.stringify(result.error ?? result)}`);
+  const modeOf=agent=>config.mode==='auto' ? roots.get(rootOf(agent))?.mode : config.mode;
+  let storePromise;
+  const storage=()=>storePromise??=ctx.storageDomain.open(defineDomain({name:'dsh_auto',version:1,layout:'per-record',
+    tables:{policies:domainTable(schema.json()),assignments:domainTable(schema.json())}}));
+  ctx.on('dispose',async()=>{if(storePromise)await(await storePromise).close();});
+
+  async function decide(agent,request,signal) {
+    const state=budget(rootOf(agent));
+    if (state.decisions>=config.maxDecisions) throw new Error('Jev task decision budget exhausted.');
+    state.decisions++;
+    const started=performance.now();
+    const response=await fetch(config.endpoint,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer magpie'},
+      body:JSON.stringify({sessionId:agent.session.id,...request}),signal});
+    const result=await response.json();
+    record({kind:'jev',session:agent.session.id,trigger:request.trigger,httpStatus:response.status,wallMs:performance.now()-started,...result});
+    if (!response.ok) throw new Error(`Magpie Jev decision failed (HTTP ${response.status}): ${JSON.stringify(result.error ?? result)}`);
     return result;
   }
 
-  ctx.tools.guard(execution => {
-    if (!delegation.has(execution.name)) return;
-    if (config.mode === 'single') return 'This task permits one main agent only.';
-    if (config.mode === 'auto') return 'Jev controls collaboration for this task; use the supplied native child results.';
-    if (!execution.agent) return 'Delegation requires a native dsh agent.';
-    const state = budget(rootOf(execution.agent));
-    if (state.children + state.pending.size >= config.maxChildren || state.active + state.pending.size >= config.maxConcurrent) return 'Task subagent resource limit reached.';
-    state.pending.add(execution.callId);
-  });
-  ctx.on('tools/result', (execution,result) => {
-    if (delegation.has(execution.name) && execution.agent) {
-      budget(rootOf(execution.agent)).pending.delete(execution.callId);
-      if (config.mode === 'native') record({kind:'native_child_tool_result',parent:execution.agent.session.id,
-        callId:execution.callId,tool:execution.name,isError:result.isError,value:result.value,error:result.error});
+  async function initialize(agent,signal) {
+    const id=agent.session.id;
+    const policies=(await storage()).table('policies');
+    let snapshot=policies.get(id);
+    if (!snapshot) {
+      const response=await fetch(config.endpoint.replace(/\/decide$/,'/policy'),{headers:{Authorization:'Bearer magpie'},signal});
+      if (!response.ok) throw new Error(`Auto policy unavailable (HTTP ${response.status}).`);
+      snapshot=await response.json();
+      if (!snapshot.enabled || !Array.isArray(snapshot.routes)) throw new Error('Magpie Auto policy is disabled or malformed.');
+      await policies.put(id,snapshot);
     }
-  });
-  ctx.on('subagent/start', info => {
-    const child = ctx.agents.get(info.id);
-    if (!child) throw new Error('Auto requires the native in-process child provider.');
-    const parent = rootOf(child), state = budget(parent);
-    childParents.set(info.id, parent); state.children++; state.active++;
-    if (state.pending.size) state.pending.delete(state.pending.values().next().value);
-    record({kind:'child_start', ...info, parent, active:state.active});
-  });
-  ctx.on('subagent/end', info => {
-    const parent = childParents.get(info.id);
-    if (parent === undefined) throw new Error('Child ended without a recorded native start.');
-    const state = budget(parent); state.active--;
-    record({kind:'child_end', ...info, parent, active:state.active});
-  });
+    const policy=snapshot.strategy;
+    if (policy) {
+      if (!['automatic','single','native'].includes(policy.mode)) throw new Error('Unsupported compiled execution policy.');
+      for (const key of ['quality','latency','usage','cache']) if (!Number.isFinite(policy.weights?.[key])) throw new Error('Missing compiled strategy weight: '+key);
+    }
+    const state={policy,mode:policy?.mode==='single'?'single':policy?.mode==='native'?'native':'auto',profiles:[],instruction:snapshot.instruction};
+    if(state.mode!=='auto'){
+      roots.set(id,state);record({kind:'policy_snapshot',session:id,mode:state.mode,policy});return state;
+    }
+    for (const route of snapshot.routes) {
+      // Native preparation validates actual client-side routes and supported effort names.
+      // An omitted/empty effort list explicitly requests the native default.
+      const efforts=route.efforts??[];
+      for (const effort of efforts.length?efforts:[undefined]) {
+        const options={provider:agent.options.provider,model:route.model,...effort===undefined?{}:{reasoningEffort:effort}};
+        try {
+          await ctx.llm.prepareCall(options,signal);
+          state.profiles.push({id:route.id+'/'+(effort??'default'),routeId:route.id,label:route.label,capability:route.description,options});
+        } catch(error) {
+          if (signal.aborted) throw error;
+          record({kind:'profile_unavailable',session:id,profile:route.id,effort:effort??null,error:String(error)});
+        }
+      }
+    }
+    if (!state.profiles.length) throw new Error('No configured Auto execution profile is supported by this native dsh connection.');
+    roots.set(id,state);
+    record({kind:'policy_snapshot',session:id,mode:state.mode,policy:state.policy,profiles:state.profiles});
+    return state;
+  }
 
-  const prepared = new Map(), nextPressure = new Map();
-  const render = m => m.role+':\n'+m.content.map(b => b.type === 'text' || b.type === 'reasoning' ? b.text : JSON.stringify(b)).join('\n');
+  ctx.tools.guard(exec=>{
+    if (!delegation.has(exec.name)) return;
+    const mode=exec.agent?modeOf(exec.agent):config.mode;
+    if (mode==='single') return 'This task permits one main agent only.';
+    if (!exec.agent) return 'Delegation requires a native dsh agent.';
+    if (exec.agent.session.header.parentSession!==undefined) return 'Nested delegation exceeds this task depth limit.';
+    const state=budget(rootOf(exec.agent));
+    const running=[...active.values()].filter(x=>x.parent===rootOf(exec.agent)).length;
+    if (state.pending.size+running>=config.maxConcurrent || (mode!=='auto' && state.children.size+state.pending.size>=config.maxChildren)) return 'Task subagent resource limit reached.';
+    if (state.childRequests>=config.maxChildRequests) return 'Task child request budget reached; complete the remaining work in the main agent.';
+    state.pending.add(exec.callId);
+  });
+  ctx.on('tools/result',(exec,result)=>{
+    if (!delegation.has(exec.name) || !exec.agent) return;
+    budget(rootOf(exec.agent)).pending.delete(exec.callId);
+    record({kind:'native_child_tool_result',parent:exec.agent.session.id,callId:exec.callId,tool:exec.name,isError:result.isError,value:result.value,error:result.error});
+  });
+  ctx.on('subagent/start',info=>{
+    const child=ctx.agents.get(info.id);
+    if (!child) throw new Error('Auto requires native in-process children.');
+    const parent=rootOf(child),state=budget(parent);
+    state.children.add(info.id);active.set(info.id,{parent,runId:info.runId});
+    const assignment=assignments.get(info.id);
+    if (assignment?.callId) state.pending.delete(assignment.callId);
+    else if (state.pending.size) state.pending.delete(state.pending.values().next().value);
+    record({kind:'child_start',...info,parent,active:[...active.values()].filter(x=>x.parent===parent).length});
+  });
+  ctx.on('subagent/end',info=>{
+    const running=active.get(info.id);
+    if (!running) throw new Error('Native child ended without a start.');
+    active.delete(info.id);settled.set(info.id,info);
+    record({kind:'child_end',...info,parent:running.parent,active:[...active.values()].filter(x=>x.parent===running.parent).length});
+    for (const done of waiters.get(info.id)??[]) done(info);
+    waiters.delete(info.id);
+  });
+  function awaitSettlement(id,previous,signal) {
+    const current=settled.get(id);
+    if (current && current.runId!==previous) return Promise.resolve(current);
+    return new Promise((resolve,reject)=>{
+      const done=value=>{signal.removeEventListener('abort',abort);resolve(value);};
+      const abort=()=>{waiters.get(id)?.delete(done);reject(signal.reason);};
+      if (!waiters.has(id)) waiters.set(id,new Set());
+      waiters.get(id).add(done);signal.addEventListener('abort',abort,{once:true});
+      if (signal.aborted) abort();
+    });
+  }
+
+  async function routeDelegation(args,exec,provider) {
+    const parent=exec.agent,state=roots.get(parent.session.id),resources=budget(parent.session.id);
+    const listing=await ctx.subagents.listChildren(parent.session.id,exec.signal);
+    const persistedAssignments=(await storage()).table('assignments');
+    const children=listing.filter(x=>x.kind==='child' && x.mode==='continuable' && !active.has(x.id)).map(child=>{
+      const assignment=assignments.get(child.id)??persistedAssignments.get(child.id);
+      return {...child,...assignment?{assignment:assignment.proposal,profile:assignment.profile.id}:{}};
+    });
+    const request={task:tasks.get(parent.session.id),trigger:'delegation',history:[],
+      observation:{proposal:args.prompt,description:args.description,profiles:state.profiles,children,
+        childRequestsRemaining:config.maxChildRequests-resources.childRequests,childrenRemaining:config.maxChildren-resources.children.size},
+      questions:delegationQuestions(state.profiles,children)};
+    const decision=await decide(parent,request,exec.signal);
+    const selected=selectDelegation(decision.answers,state.profiles,children,state.policy,{canCreate:resources.children.size<config.maxChildren});
+    record({kind:'delegation_decision',session:parent.session.id,callId:exec.callId,...selected});
+    if (selected.action==='main') throw new Error('Jev declined delegation: '+selected.reason);
+    let id,previous;
+    if (selected.action==='reuse') {
+      id=selected.child.id;previous=settled.get(id)?.runId;
+      const messageId=await ctx.subagents.sendMessage(parent,id,[{type:'text',text:args.prompt}],{signal:exec.signal});
+      record({kind:'child_reused',parent:parent.session.id,id,messageId});
+    } else {
+      id='session-'+randomUUID();
+      const task='Your assigned subtask:\n'+args.prompt+'\n\nRoot request as background and constraints (instructions to the parent or other agents are NOT your assignment):\n'+JSON.stringify(tasks.get(parent.session.id));
+      assignments.set(id,{task,proposal:args.prompt,profile:selected.profile,callId:exec.callId});
+      await persistedAssignments.put(id,assignments.get(id));
+      resources.children.add(id); // Reserve before asynchronous native creation.
+      try {
+        await ctx.subagents.startContinuable({childId:id,provider,label:args.description,
+          request:{parent,prompt:[{type:'text',text:task+'\n\nWork only on the assigned responsibility. Return concrete findings or changed files and test results within the child budget. Coordinate shared files through the parent.'}],
+            agentOptions:selected.profile.options,
+            persona:'You are a delegated child, not the parent. Perform only your assigned subtask. The quoted root request is background; do not carry out its instructions for other agents. Do not delegate. '+selected.profile.label+': '+selected.profile.capability,
+            toolFilter:{deny:['subagent','subagent_fork']},maxDepth:1},signal:exec.signal});
+      } catch(error) { assignments.delete(id);throw error; }
+    }
+    if (args.run_in_background!==false) return {kind:'continuable',subagentId:id};
+    const outcome=await awaitSettlement(id,previous,exec.signal);
+    recordCollection(parent.session.id,id,outcome);
+    if (outcome.stopReason!=='completed') throw new Error('Native child '+id+' ended with '+JSON.stringify(outcome.stopReason)+'. Its durable history and partial output remain available.');
+    if(reports.has(outcome.runId))return {kind:'foreground',output:[{type:'text',text:reports.get(outcome.runId)}]};
+    if (!Array.isArray(outcome.lastAssistantMessage) || !outcome.lastAssistantMessage.length) throw new Error('Native child completed without a final output to collect.');
+    return {kind:'foreground',output:outcome.lastAssistantMessage};
+  }
+
+  function recordCollection(parent,id,outcome) {
+    if (outcome && collected.has(outcome.runId)) return;
+    if (outcome) collected.add(outcome.runId);
+    record({kind:'child_collected',parent,id,runId:outcome?.runId,stopReason:outcome?.stopReason});
+  }
+
+  function installRouting(agent) {
+    if (wrapped.has(agent)) return;
+    for (const [name,provider] of [['subagent','spawn'],['subagent_fork','fork']]) {
+      const original=ctx.tools.get(name,agent);
+      if (!original) throw new Error('Required native delegation tool is unavailable: '+name);
+      agent.ctx.tools.register({...original,
+        description:original.description+' Jev evaluates the proposed assignment and selects a configured profile or an existing child conversation. A declined proposal stays with the parent.',
+        async execute(args,exec) {
+          const violations=validateJsonSchemaValue(original.parameters,args,'');
+          if (violations.length) throw new ToolArgsError(violations);
+          return routeDelegation(args,exec,provider);
+        }});
+    }
+    const messaging=ctx.tools.get('send_message',agent);
+    if(messaging)agent.ctx.tools.register({...messaging,async execute(args,exec){
+      try{return await messaging.execute(args,exec);}
+      catch(error){
+        const causes=[];for(let cause=error;cause;cause=cause.cause)causes.push(String(cause));
+        record({kind:'native_message_error',session:agent.session.id,causes});throw new Error(causes.join(' -> '),{cause:error});
+      }
+    }});
+    wrapped.add(agent);
+  }
+
+  function installChildReporting(agent) {
+    if(childMessaging.has(agent))return;
+    const original=ctx.tools.get('send_message',agent);
+    if(!original)throw new Error('Native child reporting requires send_message.');
+    agent.ctx.tools.register({...original,async execute(args,exec){
+      const result=await original.execute(args,exec);
+      if(args.agent_id===rootOf(agent) && ((turnRequests.get(agent.session.id)??0)>=config.maxChildTurnRequests || budget(rootOf(agent)).childRequests>=config.maxChildRequests)){
+        const run=active.get(agent.session.id);
+        if(run)reports.set(run.runId,args.message);
+        // The real native message has been accepted. Conclude this budgeted
+        // reporting turn through the tool runtime, without an extra model call.
+        exec.concludeTurn();
+        record({kind:'child_budget_report',session:agent.session.id,runId:run?.runId});
+      }
+      return result;
+    }});
+    childMessaging.add(agent);
+  }
+
   class JevCompaction extends BasicCompactionEngine {
-    async summarize(input, agent) {
-      const plan = prepared.get(agent.session.id);
-      if (!plan) throw new Error('Compaction requires a prepared Jev selection.');
-      // No second model call; native dsh owns validation, provenance and replacement.
-      return {summary:plan.summary, provider:'opencode-console', model:plan.model};
+    async summarize(input,agent,signal) {
+      const selection=prepared.get(agent.session.id);
+      return selection?{summary:selection.summary,provider:'opencode-console',model:selection.model}:super.summarize(input,agent,signal);
     }
   }
-  const compactor = config.mode === 'auto' ? new JevCompaction(ctx, {auto:false, compactionRetries:0, maxOverflowRetries:0}) : undefined;
+  const compactor=config.mode==='auto'?new JevCompaction(ctx,{auto:false,thresholdRatio:config.nativeThresholdRatio,
+    retainTokens:config.retainTokens,compactionRetries:0,maxOverflowRetries:0}):undefined;
 
-  ctx.on('agent/pre-step', async (payload, next) => {
-    const {agent, signal, messages} = payload;
-    const isChild = agent.session.header.parentSession !== undefined;
-    if (roots.has(agent.session.id)) roots.set(agent.session.id,extendTask(roots.get(agent.session.id),messages));
-    else if (isChild) roots.set(agent.session.id,messages.map(text).join('\n'));
-    if (!isChild && !roots.has(agent.session.id)) {
-      const task = messages.map(text).join('\n');
-      roots.set(agent.session.id, task);
-      record({kind:'root_start', session:agent.session.id});
-      if (config.mode === 'auto') {
-        const actions = {single:'One main coding agent. Best for a small sequential fix.'};
-        if (config.maxChildren - budget(agent.session.id).children >= 1) actions.review = 'An independent read-only investigator inspects the issue, code, and likely regression tests before the main agent implements the fix.';
-        if (config.maxChildren - budget(agent.session.id).children >= 2 && config.maxConcurrent >= 2) actions.parallel = 'Two independent read-only investigators work concurrently: one locates the cause, one examines edge cases and regression tests. Best when these investigations are substantial and separable.';
-        const result = await decide(agent, {task, trigger:'task_start', history:[], actions}, signal);
-        if (result.action !== 'single') {
-          const roles = result.action === 'parallel' ? ['Find the cause and relevant implementation.', 'Find edge cases and an appropriate regression test.'] : ['Independently investigate the cause, edge cases, and regression tests.'];
-          const runs = [];
-          try {
-            for (const role of roles) {
-              const run = await ctx.subagents.start('spawn', {
-                parent:agent, signal, label:role, maxDepth:1,
-                prompt:[{type:'text', text:`${task}\n\nYour responsibility: ${role}\nRead-only investigation: do not edit any files. You share the workspace with the main agent; do not undo its work. Return concrete findings and test commands.`}],
-                agentOptions:{provider:agent.options.provider, model:agent.options.model},
-              });
-              runs.push(run);
-            }
-            const outcomes = await Promise.all(runs.map(run => run.result));
-            outcomes.forEach((outcome,i) => record({kind:'child_collected',parent:agent.session.id,role:roles[i],stopReason:outcome.stopReason}));
-            const notes = outcomes.map((outcome, i) => {
-              if (outcome.stopReason !== 'completed') throw new Error(`Native child failed: ${JSON.stringify(outcome.stopReason)}`);
-              return roles[i]+'\n'+outcome.output.filter(b => b.type === 'text').map(b => b.text).join('\n');
-            });
-            const admitted = await next();
-            if (admitted.kind === 'reject') return admitted;
-            return {...admitted, messages:[...admitted.messages, createUserMessage({content:[{type:'text', text:'Collected independent investigation results:\n'+notes.join('\n\n')}], source:{kind:'plugin',plugin:'dsh-auto'}})]};
-          } finally { await Promise.all(runs.map(run => run.dispose())); }
-        }
+  ctx.on('agent/pre-step',async(payload,next)=>{
+    const {agent,messages,signal}=payload,id=agent.session.id,isChild=agent.session.header.parentSession!==undefined;
+    if (isChild && turnIds.get(id)!==payload.turn) {turnIds.set(id,payload.turn);turnRequests.set(id,0);}
+    for (const message of messages) if (message.source.kind==='subagent-settled')
+      recordCollection(id,message.source.senderSessionId,settled.get(message.source.senderSessionId));
+    if (!tasks.has(id)) {
+      const assignment=assignments.get(id)??(config.mode==='auto'?(await storage()).table('assignments').get(id):undefined);
+      if (assignment) {
+        tasks.set(id,assignment.task);
+      } else {
+        const previous=agent.session.snapshotEvents().filter(e=>e.type==='user/message').map(e=>agent.session.deriveEventMessage(e)).filter(Boolean);
+        tasks.set(id,extendTask('',previous));
+        tasks.set(id,extendTask(tasks.get(id),messages));
+      }
+      record({kind:isChild?'child_assignment':'root_start',session:id});
+    } else {
+      tasks.set(id,extendTask(tasks.get(id),messages));
+      if(isChild)for(const message of messages)if(message.source.kind==='agent-message' && message.source.senderSessionId===rootOf(agent))
+        tasks.set(id,tasks.get(id)+'\n\nFollow-up assignment:\n'+text(message));
+    }
+    if (!isChild && config.mode==='auto' && !roots.has(id)) {
+      const state=await initialize(agent,signal);
+      if (state.mode==='auto') installRouting(agent);
+      return next();
+    }
+    if(!isChild && modeOf(agent)==='auto')installRouting(agent);
+    if (isChild) {
+      installChildReporting(agent);
+      const state=budget(rootOf(agent)),used=turnRequests.get(id)??0;
+      if (state.childRequests>=config.maxChildRequests || used>=config.maxChildTurnRequests) {
+        record({kind:'child_budget_exhausted',session:id,taskChildRequests:state.childRequests,turnRequests:used});
+        throw new Error('Child request budget exhausted; parent budget remains available.');
+      }
+      if (used===config.maxChildTurnRequests-1 || state.childRequests===config.maxChildRequests-1) {
+        const admitted=await next();
+        if (admitted.kind==='reject') return admitted;
+        return {...admitted,messages:[...admitted.messages,note('This is your final model request under the child budget. Return the concrete result, test evidence, and any unfinished work now.')]};
       }
     }
-    if (compactor && agent.session.requestHeader() !== undefined) {
-      const measured = ctx.tokenMeter.measure(agent.session);
-      if (measured.totalTokens >= Math.max(config.pressureTokens, nextPressure.get(agent.session.id) ?? config.pressureTokens)) {
-        const nodes = [...agent.session.surface.nodes];
-        let start = 2, end = nodes.length-1, kept = 0;
-        while (end >= start && kept < config.retainTokens) { kept += measured.nodes[end].tokens; end--; }
-        while (start <= end && !toolPairingBalancedBefore(agent.session, nodes[start])) start++;
-        while (end >= start && !toolPairingBalancedAfter(agent.session, nodes[end])) end--;
-        if (end > start) {
-          const region = nodes.slice(start, end+1).map(seq => ({seq, message:agent.session.deriveEventMessage(agent.session.eventAt(seq))})).filter(x => x.message !== null);
-          const history = region.map(x => ({id:'event_'+x.seq, kind:x.message.role, text:JSON.stringify(x.message), required:x.message.source.kind === 'user'}));
-          const usage = agent.session.snapshotEvents().toReversed().find(e => e.data?.usage !== undefined)?.data.usage;
-          const task = roots.get(agent.session.id) ?? region.filter(x => x.message.source.kind === 'user').map(x => text(x.message)).join('\n');
-          const decision = await pressureDecision(request => decide(agent,request,signal),task,history,
-            {nativeUsage:usage, estimatedContextTokens:measured.totalTokens,contextWindow:agent.session.requestContext()?.contextWindow},
-            {keep:'Keep current history unchanged to preserve its warmed prefix cache when the context still fits.',
-             select:'Omit clearly irrelevant old evidence only when the reduction justifies losing cache reuse from the first replaced history token. Retain all explicit instructions and complete useful results.'});
-          const selected = new Set(decision.selectedIds);
-          const summary = region.filter(x => selected.has('event_'+x.seq)).map(x => ({type:'text',text:render(x.message)}));
-          const shadowedTokens = measured.nodes.slice(start,end+1).reduce((sum,node) => sum+node.tokens,0);
-          const estimated = summary.length ? ctx.tokenMeter.estimateMessage(createUserMessage({content:summary,source:{kind:'plugin',plugin:'dsh-auto'}}))+200 : 0;
-          // A keep decision and an unhelpful reduction are explicit no-ops, not failures.
-          if (decision.action === 'keep' || !summary.length || estimated >= shadowedTokens) {
-            record({kind:'context_kept', session:agent.session.id, reason:decision.action === 'keep' ? 'Jev chose stable history' : 'No useful balanced reduction', estimatedContextTokens:measured.totalTokens});
-            nextPressure.set(agent.session.id, measured.totalTokens+8000);
-          } else {
-            prepared.set(agent.session.id,{summary,model:decision.model});
-            try {
-              const result = await compactor.compactRegion(nodes[start],nodes[end],agent,signal);
-              record({kind:'context_replaced',session:agent.session.id,start:nodes[start],end:nodes[end],sourceCount:result.shadowedSeqs.length});
-            } finally { prepared.delete(agent.session.id); }
-          }
-        }
-      }
+    if (compactor && agent.session.requestHeader()!==undefined) {
+      if (modeOf(agent)!=='auto') await compactor.compactIfNeeded(agent,'pressure',signal);
+      else await selectUnderPressure(agent,signal);
     }
     return next();
   });
+  ctx.on('llm/stream',async function*(options,next){
+    const agent=options.sessionId?ctx.agents.get(options.sessionId):undefined;
+    if (agent && agent.session.header.parentSession!==undefined) {
+      const state=budget(rootOf(agent)),used=turnRequests.get(agent.session.id)??0;
+      if(state.childRequests>=config.maxChildRequests || used>=config.maxChildTurnRequests)throw new Error('Child model-call budget exhausted, including compaction calls.');
+      state.childRequests++;turnRequests.set(agent.session.id,used+1);
+    }
+    const started=performance.now();let usage;
+    const dispatchEstimate=agent?ctx.tokenMeter.measure(agent.session).totalTokens:undefined;
+    try {
+      for await(const chunk of next()){if(chunk.type==='usage')usage=chunk.usage;yield chunk;}
+    }finally{
+      if(agent && options.purpose===undefined){
+        if(Number.isFinite(usage?.totalTokens) && Number.isFinite(usage?.outputTokens))
+          pressureAnchors.set(agent.session.id,{input:usage.totalTokens-usage.outputTokens,estimate:dispatchEstimate});
+        else pressureAnchors.delete(agent.session.id);
+      }
+      record({kind:'execution_call',session:options.sessionId,model:options.model,effort:options.reasoningEffort,
+        purpose:options.purpose??'execution',wallMs:performance.now()-started,...usage===undefined?{}:{usage}});
+    }
+  });
+  ctx.on('session/event',(session,event)=>{
+    if(event.type==='compaction/summary')pressureAnchors.delete(session.id);
+  });
+
+  async function selectUnderPressure(agent,signal) {
+    const id=agent.session.id,measured=ctx.tokenMeter.measure(agent.session);
+    const anchor=pressureAnchors.get(id);
+    const pressure=anchor?anchor.input+Math.max(0,measured.totalTokens-anchor.estimate):measured.totalTokens;
+    if (pressure<Math.max(config.pressureTokens,nextPressure.get(id)??config.pressureTokens)) return;
+    record({kind:'context_pressure',session:id,nativeEstimate:measured.totalTokens,pressure,
+      basis:anchor?'observed_input_plus_estimated_growth':'native_estimate',...(anchor?{observedInput:anchor.input}:{})});
+    const nodes=[...agent.session.surface.nodes];let start=2,end=nodes.length-1,tail=0;
+    while(end>=start && tail<config.retainTokens){tail+=measured.nodes[end].tokens;end--;}
+    while(start<=end && !toolPairingBalancedBefore(agent.session,nodes[start])) start++;
+    while(end>=start && !toolPairingBalancedAfter(agent.session,nodes[end])) end--;
+    if(end<=start)return;
+    const region=nodes.slice(start,end+1).map(seq=>({seq,message:agent.session.deriveEventMessage(agent.session.eventAt(seq))})).filter(x=>x.message!==null);
+    const units=items=>items.flatMap(({seq,message})=>{
+      const required=message.role==='system'||message.source.kind==='user'||
+        (agent.session.header.parentSession!==undefined && message.source.kind==='agent-message' && message.source.senderSessionId===rootOf(agent));
+      if(required)return [{id:'event_'+seq,kind:message.role,text:JSON.stringify(message),required:true}];
+      // Logical blocks keep final evidence separate from speculative reasoning.
+      // Every block is complete; the original full messages stay in the journal.
+      return message.content.map((block,i)=>({id:'event_'+seq+'_block_'+i,kind:message.role+'/'+block.type,text:JSON.stringify(block),required:false}));
+    });
+    const history=units(region);
+    const recent=units(nodes.slice(end+1).map(seq=>({seq,message:agent.session.deriveEventMessage(agent.session.eventAt(seq))})).filter(x=>x.message!==null))
+      .filter(x=>!x.kind.endsWith('/reasoning')).slice(-3);
+    const currentEvidence=[],withheld=[];
+    for(const unit of recent) {
+      if(Buffer.byteLength(JSON.stringify([...currentEvidence,unit]))<=6000)currentEvidence.push(unit);
+      else withheld.push(unit.id);
+    }
+    const observation={contextPressure:pressure,nativeEstimate:measured.totalTokens,currentEvidence,recentEvidenceOutsideBudget:withheld};
+    const state=budget(rootOf(agent));
+    const batches=selectionBatches(tasks.get(id),history,observation);
+    if(state.decisions+batches.length>config.maxDecisions){
+      record({kind:'decision_budget_boundary',session:id,action:'native_compaction',requiredCalls:batches.length,remaining:config.maxDecisions-state.decisions});
+      await compactor.compactIfNeeded(agent,'pressure',signal);return;
+    }
+    const children=await ctx.subagents.listChildren(rootOf(agent),signal);
+    const owners=Object.fromEntries(children.filter(x=>x.kind==='child'&&x.id!==id).map(x=>[x.id,'Existing child responsibility: '+x.label]));
+    const weights=roots.get(rootOf(agent))?.policy?.weights??{quality:0.5,cache:0.5};
+    const selection=await scoreContext(request=>decide(agent,request,signal),tasks.get(id),history,owners,observation,0.4+0.2*weights.quality);
+    const selected=new Set(selection.selectedIds);
+    const summary=history.filter(x=>selected.has(x.id)).map(x=>({type:'text',text:x.kind+':\n'+x.text}));
+    if(!summary.length)summary.push({type:'text',text:'Earlier unrelated evidence was archived; the complete original events remain in this session journal.'});
+    const removedTokens=measured.nodes.slice(start,end+1).reduce((n,node)=>n+node.tokens,0);
+    const replacementTokens=ctx.tokenMeter.estimateMessage(note(summary.map(x=>x.text).join('\n')))+200;
+    record({kind:'context_scores',session:id,judgments:selection.judgments,estimatedBefore:removedTokens,estimatedAfter:replacementTokens});
+    const minimumReduction=0.1+0.1*weights.cache;
+    if(replacementTokens>=removedTokens*(1-minimumReduction)){
+      record({kind:'context_kept',session:id,reason:'Scored sources do not offer a meaningful reduction',estimatedContextTokens:measured.totalTokens});
+      nextPressure.set(id,Math.ceil(pressure*(1.25+0.5*weights.cache)));return;
+    }
+    prepared.set(id,{summary,model:selection.model});
+    try{
+      const result=await compactor.compactRegion(nodes[start],nodes[end],agent,signal);
+      record({kind:'context_replaced',session:id,start:nodes[start],end:nodes[end],sourceCount:result.shadowedSeqs.length});
+      nextPressure.delete(id);
+    }finally{prepared.delete(id);}
+  }
 }

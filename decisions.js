@@ -1,6 +1,7 @@
 // Conservative byte budget for Jev's documented 32k state + longest-question
 // limit. This is a transport bound, not a token or billing measurement.
 export const STATE_BYTES = 24000;
+import {contextQuestions} from './routing.js';
 const size = value => Buffer.byteLength(JSON.stringify(value));
 
 export function extendTask(task,messages) {
@@ -9,8 +10,8 @@ export function extendTask(task,messages) {
   return [task,...requests].filter(Boolean).join('\n\n');
 }
 
-export function selectionBatches(task, history) {
-  const base = {task, trigger:'selection', history:[]};
+export function selectionBatches(task, history, observation={}) {
+  const base = {task, trigger:'selection', history:[], observation};
   if (size(base) + 1000 >= STATE_BYTES) throw new Error('The complete task exceeds the Jev decision state budget.');
   const batches = [];
   let batch = {...base, history:[]}, sources = new Map();
@@ -20,7 +21,7 @@ export function selectionBatches(task, history) {
   };
   for (const unit of history.filter(unit => !unit.required)) {
     if (size({...base, history:[unit]}) <= STATE_BYTES) {
-      if (size({...batch, history:[...batch.history,unit]}) > STATE_BYTES) flush();
+      if (batch.history.length>=32 || size({...batch, history:[...batch.history,unit]}) > STATE_BYTES) flush();
       batch.history.push(unit); sources.set(unit.id, unit.id);
       continue;
     }
@@ -48,31 +49,19 @@ export function selectionBatches(task, history) {
   return batches;
 }
 
-export async function pressureDecision(decide, task, history, observation, actions) {
-  const control = {task,trigger:'pressure',history:[],observation:{...observation,candidateCount:history.length},actions};
-  if (size(control) + 1000 >= STATE_BYTES) throw new Error('The complete task exceeds the Jev decision state budget.');
-  // Include complete recent evidence when it fits; identify what was withheld
-  // from this routing call. Selection, when needed, judges every source.
-  const withheld = [];
-  for (const unit of history.slice(-3)) {
-    const recent = {...unit,required:true};
-    if (size({...control,history:[...control.history,recent]}) + 1000 < STATE_BYTES) control.history.push(recent);
-    else withheld.push(unit.id);
-  }
-  control.observation.recentEvidenceOutsideRoutingBudget = withheld;
-  const route = await decide(control);
-  if (route.action === 'keep') return route;
-  if (route.action !== 'select') throw new Error('Jev pressure decision returned an unsupported action.');
-  const selected = new Set(history.filter(unit => unit.required).map(unit => unit.id));
-  const batches = selectionBatches(task,history);
-  for (const {request,sources} of batches) {
-    const result = await decide(request);
-    for (const id of result.selectedIds) {
-      if (!sources.has(id)) throw new Error('Jev returned an unoffered context ID.');
-      selected.add(sources.get(id));
+export async function scoreContext(decide, task, history, owners, observation, confidenceThreshold=0.5) {
+  const selected=new Set(history.filter(unit=>unit.required).map(unit=>unit.id));
+  const judgments=[];let model;
+  for (const {request,sources} of selectionBatches(task,history,observation)) {
+    request.questions=contextQuestions(request.history,owners);
+    const result=await decide(request);model=result.model;
+    for (const [i,unit] of request.history.entries()) {
+      const importance=result.answers['importance_'+i],owner=result.answers['owner_'+i];
+      const original=sources.get(unit.id);
+      const retained=importance.confidence<confidenceThreshold || importance.score>=1 || owner.confidence<confidenceThreshold || owner.choice==='shared';
+      if (retained) selected.add(original);
+      judgments.push({source:original,part:unit.id,importance,owner,retained});
     }
   }
-  // This is client composition of recorded primitive answers, not invented
-  // aggregate usage. Each real call is separately recorded by decide().
-  return {...route,selectedIds:history.filter(unit => selected.has(unit.id)).map(unit => unit.id)};
+  return {model,selectedIds:history.filter(unit=>selected.has(unit.id)).map(unit=>unit.id),judgments};
 }
