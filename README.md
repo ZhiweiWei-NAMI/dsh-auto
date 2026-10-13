@@ -60,8 +60,10 @@ Magpie 的 Auto 配置指定 `decider: jev-1.13-free` 和 Console 密钥文件�
 
 ## 验证
 
-v0.3.0 的真实编程探针完成了同一个原生子代理的两次激活与结果回收。第二次激活首请求保持系统提示、工具和历史前缀稳定，实测输入 11,513、命中 6,912、未命中 4,601 token。另一个刻意降低压力阈值的探针完成两次真实 Jev 上下文替换，代码测试及末尾的制表符约束通过。这证明链路可运行，不证明性能提升；失败的开发探针也保留在[修订记录](https://github.com/ZhiweiWei-NAMI/magpie-auto/tree/feature/auto-workspace/experiments/jev-routing-revision)。
+v0.3.0 已通过原生 dsh 从 GitHub 安装，并在真实编程探针中由 Jev 选择复用同一个子代理，完成两次激活与结果回收。第二次激活首请求保持系统提示、工具和历史前缀稳定，实测输入 9,607、命中 6,784、未命中 2,823 token。此次共 5 次 Jev 判断，包含被拒绝后重新提出的候选；不能把这部分开销隐去。另一个刻意降低压力阈值的探针完成两次真实 Jev 上下文替换并通过代码测试。这证明链路可运行，不证明性能提升；失败的开发探针也保留在[修订记录](https://github.com/ZhiweiWei-NAMI/magpie-auto/tree/feature/auto-workspace/experiments/jev-routing-revision)。
 
 固定十二题 SWE-bench Verified 已完成三组官方判分：Auto 解决 6/12，单代理与原生可选子代理各解决 8/12。正式 Auto 运行启动三个调查子代理，一位完成，两位失败；原生可选组自行选择了全部单代理执行。71 次 Jev 请求均成功。实际补丁、主代理/子代理/Jev 用量和缓存统计见 [实验记录](https://github.com/ZhiweiWei-NAMI/magpie-auto/tree/feature/auto-workspace/experiments/jev-cache-20261012)。
 
 上述十二题使用旧 v0.2.2；三组全部解决的五题中，Auto 比单代理少 12.7% 未命中 token，但输出多 27.9%、耗时多 6.7%，未证明整体节省。旧正式任务未发生上下文替换。v0.3.0 的两题诊断另列，不覆盖旧结果，不作为无偏的新 benchmark。当前 WorkBuddy 服务仍轮换账号，缓存条件限制了结论。
+
+本轮两题三组官方解决率均为 1/2；三轮短任务每组 3/3，任务级 Jev 均为零。短任务耗时中位数 A/B/C 为 16.55 / 16.95 / 18.16 秒，样本不足以宣称显著优势。系统和工具稳定仍不能保证命中：同一会话切到新账号常仅命中 0–384 token，回到旧账号时命中量接近它先前接收的输入。共享服务未重启，不能把缓存抖动说成已经全部解决。
