@@ -42,6 +42,7 @@ export function apply(ctx,config) {
   const roots=new Map(),tasks=new Map(),budgets=new Map(),assignments=new Map();
   const active=new Map(),settled=new Map(),waiters=new Map(),prepared=new Map(),nextPressure=new Map();
   const pressureAnchors=new Map();
+  const declinedDelegation=new Set();
   const turnRequests=new Map(),turnIds=new Map(),wrapped=new WeakSet(),collected=new Set(),reports=new Map(),childMessaging=new WeakSet();
   const rootOf=agent=>agent.session.header.parentSession ?? agent.session.id;
   const budget=id=>{
@@ -116,6 +117,7 @@ export function apply(ctx,config) {
     const mode=exec.agent?modeOf(exec.agent):config.mode;
     if (mode==='single') return 'This task permits one main agent only.';
     if (!exec.agent) return 'Delegation requires a native dsh agent.';
+    if (declinedDelegation.has(exec.agent.session.id)) return 'Jev already declined delegation with the current evidence. No child was created. Continue the work in the main agent; do not retry by rewording the proposal. Reconsider only after a new observation or user/child message.';
     if (exec.agent.session.header.parentSession!==undefined) return 'Nested delegation exceeds this task depth limit.';
     const state=budget(rootOf(exec.agent));
     const running=[...active.values()].filter(x=>x.parent===rootOf(exec.agent)).length;
@@ -124,6 +126,7 @@ export function apply(ctx,config) {
     state.pending.add(exec.callId);
   });
   ctx.on('tools/result',(exec,result)=>{
+    if (exec.agent && !delegation.has(exec.name) && !result.isError) declinedDelegation.delete(exec.agent.session.id);
     if (!delegation.has(exec.name) || !exec.agent) return;
     budget(rootOf(exec.agent)).pending.delete(exec.callId);
     record({kind:'native_child_tool_result',parent:exec.agent.session.id,callId:exec.callId,tool:exec.name,isError:result.isError,value:result.value,error:result.error});
@@ -171,10 +174,11 @@ export function apply(ctx,config) {
     const children=knownChildren.filter(x=>x.mode==='continuable' && !active.has(x.id));
     const recent=[...parent.session.surface.nodes].slice(-4).flatMap(seq=>{
       const message=parent.session.deriveEventMessage(parent.session.eventAt(seq));
-      return message?message.content.filter(block=>block.type!=='reasoning').map((block,i)=>({id:'event_'+seq+'_evidence_'+i,kind:message.role+'/'+block.type,text:JSON.stringify(block)})):[];
+      // A requested tool call is an intention, not evidence of completed or assigned work.
+      return message?message.content.filter(block=>block.type!=='reasoning' && block.type!=='tool-call').map((block,i)=>({id:'event_'+seq+'_evidence_'+i,kind:message.role+'/'+block.type,text:JSON.stringify(block)})):[];
     }).slice(-3);
     const request={task:tasks.get(parent.session.id),trigger:'delegation',history:[],
-      observation:{proposal:args.prompt,description:args.description,profiles:state.profiles,children:knownChildren,...boundedEvidence(recent),
+      observation:{proposal:args.prompt,proposalStatus:'Pending approval; this call has not created or assigned a child.',description:args.description,profiles:state.profiles,children:knownChildren,...boundedEvidence(recent),
         childRequestsRemaining:config.maxChildRequests-resources.childRequests,childrenRemaining:config.maxChildren-resources.children.size},
       questions:delegationQuestions(state.profiles,children)};
     const {questions,...decisionState}=request;
@@ -182,7 +186,10 @@ export function apply(ctx,config) {
     const decision=await decide(parent,request,exec.signal);
     const selected=selectDelegation(decision.answers,state.profiles,children,state.policy,{canCreate:resources.children.size<config.maxChildren});
     record({kind:'delegation_decision',session:parent.session.id,callId:exec.callId,...selected});
-    if (selected.action==='main') throw new Error('Jev declined delegation: '+selected.reason);
+    if (selected.action==='main') {
+      declinedDelegation.add(parent.session.id);
+      throw new Error('Jev declined delegation: '+selected.reason+' No child was created. Complete the work in the main agent; do not retry by rewording the proposal.');
+    }
     let id,previous;
     if (selected.action==='reuse') {
       id=selected.child.id;previous=settled.get(id)?.runId;
@@ -206,9 +213,9 @@ export function apply(ctx,config) {
     const outcome=await awaitSettlement(id,previous,exec.signal);
     recordCollection(parent.session.id,id,outcome);
     if (outcome.stopReason!=='completed') throw new Error('Native child '+id+' ended with '+JSON.stringify(outcome.stopReason)+'. Its durable history and partial output remain available.');
-    if(reports.has(outcome.runId))return {kind:'foreground',output:[{type:'text',text:reports.get(outcome.runId)}]};
+    if(reports.has(outcome.runId))return {kind:'foreground',runId:outcome.runId,output:[{type:'text',text:reports.get(outcome.runId)}]};
     if (!Array.isArray(outcome.lastAssistantMessage) || !outcome.lastAssistantMessage.length) throw new Error('Native child completed without a final output to collect.');
-    return {kind:'foreground',output:outcome.lastAssistantMessage};
+    return {kind:'foreground',runId:outcome.runId,output:outcome.lastAssistantMessage};
   }
 
   function recordCollection(parent,id,outcome) {
@@ -270,6 +277,7 @@ export function apply(ctx,config) {
 
   ctx.on('agent/pre-step',async(payload,next)=>{
     const {agent,messages,signal}=payload,id=agent.session.id,isChild=agent.session.header.parentSession!==undefined;
+    if (messages.some(m=>['user','agent-message','subagent-settled'].includes(m.source.kind))) declinedDelegation.delete(id);
     if (isChild && turnIds.get(id)!==payload.turn) {turnIds.set(id,payload.turn);turnRequests.set(id,0);}
     for (const message of messages) if (message.source.kind==='subagent-settled')
       recordCollection(id,message.source.senderSessionId,settled.get(message.source.senderSessionId));

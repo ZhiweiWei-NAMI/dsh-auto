@@ -25,7 +25,7 @@ dsh --profile auto --from-default-profile headless --dump-config >/dev/null
 dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto#v0.3.1
 ```
 
-v0.3.1 声明了原生 `dsh.bundle`，安装后自动挂载插件并停用 `compaction-basic`，无需手写 `insert`。卸载 `dsh plugin --profile auto remove dsh-auto` 会移除该层并恢复原生压缩。旧版手工添加的 `magpie-auto` 和压缩开关应先从用户 patch 中移除，避免重复挂载。
+v0.3.1 声明了原生 `dsh.bundle`，安装后自动挂载插件并停用 `compaction-basic`，无需手写 `insert`。卸载时先移除 profile 中自定义的 `magpie-auto` 覆盖条目，再运行 `dsh plugin --profile auto remove dsh-auto`，会移除该层并恢复原生压缩。旧版手工添加的 `magpie-auto` 和压缩开关应先从用户 patch 中移除，避免重复挂载。
 
 执行模型连接仍需配置。服务器 `auto/cordis.patch.yml` 将 `settings` 指向同目录的 `settings.yaml`，其中选择 `deepseek-official` 适配器、`dsh-workbuddy/deepseek-v4.1-flash` 模型和 `http://127.0.0.1:3435/v1` 网关。该 profile 的 `.credentials.yaml` 仅存本机网关所需的非秘密占位值，不含上游账号或 Console 密钥。
 
