@@ -15,6 +15,26 @@ export const name='magpie-auto';
 export const inject=['llm','tokenMeter','sessions','subagents','tools','agents','storageDomain'];
 export const Config=z.object({
   mode:z.union(['auto','single','native']).default('auto'),
+  apiKey:z.string().role('secret'),
+  jevModel:z.string().default('jev-1.13-free'),
+  jevEndpoint:z.string().default('https://opencode.ai/inference/v1/systemone'),
+  routes:z.array(z.object({
+    id:z.string(),
+    label:z.string(),
+    model:z.string(),
+    description:z.string(),
+    efforts:z.array(z.string()).default([]),
+  })).default([]),
+  strategy:z.object({
+    mode:z.union(['automatic','single','native']).default('automatic'),
+    weights:z.object({
+      quality:z.number().min(0).max(1).default(0.8),
+      latency:z.number().min(0).max(1).default(0.5),
+      usage:z.number().min(0).max(1).default(0.5),
+      cache:z.number().min(0).max(1).default(0.8),
+    }).default({quality:0.8,latency:0.5,usage:0.5,cache:0.8}),
+    routeWeights:z.dict(z.any()).default({}),
+  }),
   endpoint:z.string().default('http://127.0.0.1:3435/v1/auto/decide'),
   maxChildren:z.number().step(1).min(0).default(2),
   maxConcurrent:z.number().step(1).min(1).default(2),
@@ -29,6 +49,7 @@ export const Config=z.object({
 const delegation=new Set(['subagent','subagent_fork']);
 const text=m=>m.content.filter(b=>b.type==='text').map(b=>b.text).join('\n');
 const note=value=>createUserMessage({content:[{type:'text',text:value}],source:{kind:'plugin',plugin:'dsh-auto'}});
+const redact=(value,secret)=>secret?value.split(secret).join('[redacted]'):value;
 const boundedEvidence=units=>{
   const currentEvidence=[],recentEvidenceOutsideBudget=[];
   for(const unit of units) {
@@ -63,6 +84,19 @@ export function apply(ctx,config) {
     if (state.decisions>=config.maxDecisions) throw new Error('Jev task decision budget exhausted.');
     state.decisions++;
     const started=performance.now();
+    if (config.apiKey) {
+      const {questions,...decisionState}=request;
+      const response=await fetch(config.jevEndpoint,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+config.apiKey},
+        body:JSON.stringify({model:config.jevModel,state:JSON.stringify(decisionState),questions}),signal});
+      const bodyText=redact(await response.text(),config.apiKey);
+      if (!response.ok) throw new Error(`Jev decision failed (HTTP ${response.status}): ${bodyText}`);
+      let result;
+      try { result=JSON.parse(bodyText); } catch {
+        throw new Error(`Jev decision returned invalid JSON (HTTP ${response.status}): ${bodyText}`);
+      }
+      record({kind:'jev',session:agent.session.id,trigger:request.trigger,httpStatus:response.status,wallMs:performance.now()-started,...result});
+      return result;
+    }
     const response=await fetch(config.endpoint,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer magpie'},
       body:JSON.stringify({sessionId:agent.session.id,...request}),signal});
     const result=await response.json();
@@ -76,10 +110,15 @@ export function apply(ctx,config) {
     const policies=(await storage()).table('policies');
     let snapshot=policies.get(id);
     if (!snapshot) {
-      const response=await fetch(config.endpoint.replace(/\/decide$/,'/policy'),{headers:{Authorization:'Bearer magpie'},signal});
-      if (!response.ok) throw new Error(`Auto policy unavailable (HTTP ${response.status}).`);
-      snapshot=await response.json();
-      if (!snapshot.enabled || !Array.isArray(snapshot.routes)) throw new Error('Magpie Auto policy is disabled or malformed.');
+      if (config.apiKey) {
+        snapshot={enabled:true,routes:config.routes,
+          strategy:config.strategy ?? {mode:'automatic',weights:{quality:0.8,latency:0.5,usage:0.5,cache:0.8}}};
+      } else {
+        const response=await fetch(config.endpoint.replace(/\/decide$/,'/policy'),{headers:{Authorization:'Bearer magpie'},signal});
+        if (!response.ok) throw new Error(`Auto policy unavailable (HTTP ${response.status}).`);
+        snapshot=await response.json();
+      }
+      if (!snapshot.enabled || !Array.isArray(snapshot.routes)) throw new Error('Auto policy is disabled or malformed.');
       await policies.put(id,snapshot);
     }
     const policy=snapshot.strategy;
@@ -92,8 +131,6 @@ export function apply(ctx,config) {
       roots.set(id,state);record({kind:'policy_snapshot',session:id,mode:state.mode,policy});return state;
     }
     for (const route of snapshot.routes) {
-      // Native preparation validates actual client-side routes and supported effort names.
-      // An omitted/empty effort list explicitly requests the native default.
       const efforts=route.efforts??[];
       for (const effort of efforts.length?efforts:[undefined]) {
         const options={provider:agent.options.provider,model:route.model,...effort===undefined?{}:{reasoningEffort:effort}};
@@ -174,7 +211,6 @@ export function apply(ctx,config) {
     const children=knownChildren.filter(x=>x.mode==='continuable' && !active.has(x.id));
     const recent=[...parent.session.surface.nodes].slice(-4).flatMap(seq=>{
       const message=parent.session.deriveEventMessage(parent.session.eventAt(seq));
-      // A requested tool call is an intention, not evidence of completed or assigned work.
       return message?message.content.filter(block=>block.type!=='reasoning' && block.type!=='tool-call').map((block,i)=>({id:'event_'+seq+'_evidence_'+i,kind:message.role+'/'+block.type,text:JSON.stringify(block)})):[];
     }).slice(-3);
     const request={task:tasks.get(parent.session.id),trigger:'delegation',history:[],
@@ -256,8 +292,6 @@ export function apply(ctx,config) {
       if(args.agent_id===rootOf(agent) && ((turnRequests.get(agent.session.id)??0)>=config.maxChildTurnRequests || budget(rootOf(agent)).childRequests>=config.maxChildRequests)){
         const run=active.get(agent.session.id);
         if(run)reports.set(run.runId,args.message);
-        // The real native message has been accepted. Conclude this budgeted
-        // reporting turn through the tool runtime, without an extra model call.
         exec.concludeTurn();
         record({kind:'child_budget_report',session:agent.session.id,runId:run?.runId});
       }
@@ -363,8 +397,6 @@ export function apply(ctx,config) {
       const required=message.role==='system'||message.source.kind==='user'||
         (agent.session.header.parentSession!==undefined && message.source.kind==='agent-message' && message.source.senderSessionId===rootOf(agent));
       if(required)return [{id:'event_'+seq,kind:message.role,text:JSON.stringify(message),required:true}];
-      // Logical blocks keep final evidence separate from speculative reasoning.
-      // Every block is complete; the original full messages stay in the journal.
       return message.content.map((block,i)=>({id:'event_'+seq+'_block_'+i,kind:message.role+'/'+block.type,text:JSON.stringify(block),required:false}));
     });
     const history=units(region);

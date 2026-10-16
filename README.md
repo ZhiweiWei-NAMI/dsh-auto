@@ -1,8 +1,43 @@
 # dsh-auto
 
-Magpie Auto 的 dsh 客户端插件。Magpie 调用真正的 `jev-1.13-free`，返回结构化决策；这个插件通过 dsh 原生会话、工具和子代理接口落实决策。主代理和子代理使用同一个 DeepSeek 执行模型。插件不包含智能体执行运行时。
+dsh 的 Auto 决策插件。可以使用自己的 API Key 直连 `jev-1.13-free`，也可以通过 Magpie 获取结构化决策；插件通过 dsh 原生会话、工具和子代理接口落实决策。主代理和子代理使用配置的执行模型。插件不包含智能体执行运行时。
 
-需要 dsh `0.1.5-rc.1` 及本 fork 的 Magpie Auto 决策接口。服务器已经具备这些依赖。
+需要 dsh `0.1.5-rc.1`。Magpie 是可选的；通过 Magpie 使用时，需要本 fork 的 Magpie Auto 决策接口。
+
+## 独立使用
+
+插件可以直连 Jev，不再依赖本机 Magpie：配置了 `apiKey` 就走直连，只配置 `endpoint` 才走 Magpie。Magpie 是可选的。
+
+```bash
+# 新建 profile，然后从 GitHub 或 npm 安装
+dsh --profile auto --from-default-profile headless --dump-config >/dev/null
+dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto#v0.4.0
+# 或 npm 包 dsh-auto
+dsh plugin --profile auto add dsh-auto
+```
+
+在 profile 自己的 `cordis.patch.yml` 里给 `magpie-auto` 填最小配置。`apiKey` 到 <https://opencode.ai> 的 workspace API Keys 页面获取：
+
+```yaml
+- id: magpie-auto
+  config:
+    apiKey: <你的 opencode workspace key>
+    routes:
+      - id: general
+        label: 通用实现
+        model: deepseek-v4.1-flash
+        description: 实现与修改代码
+        efforts: [high]
+      - id: review
+        label: 独立检查
+        model: deepseek-v4.1-flash
+        description: 复核实现与测试证据
+        efforts: [high]
+```
+
+`routes` 是允许使用的角色、模型和 effort，执行模型连接仍由 `settings.yaml` 决定。省略 `strategy` 时使用 `automatic` 模式和默认权重 `{quality: 0.8, latency: 0.5, usage: 0.5, cache: 0.8}`；`mode: single` / `native` 分别固定单代理和原生压缩。`apiKey` 声明为 secret，不会写入日志或记录文件。
+
+保留下面的 Magpie 用法：`apiKey` 未设置且 `endpoint` 指向本机 Magpie 时，策略快照仍从 Magpie 的 `/policy` 读取。
 
 ## 启用
 
@@ -22,10 +57,10 @@ dsh --profile auto --patch "$DSH_HOME/profiles/auto/node_modules/dsh-auto/off.pa
 
 ```bash
 dsh --profile auto --from-default-profile headless --dump-config >/dev/null
-dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto#v0.3.1
+dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto#v0.4.0
 ```
 
-v0.3.1 声明了原生 `dsh.bundle`，安装后自动挂载插件并停用 `compaction-basic`，无需手写 `insert`。卸载时先移除 profile 中自定义的 `magpie-auto` 覆盖条目，再运行 `dsh plugin --profile auto remove dsh-auto`，会移除该层并恢复原生压缩。旧版手工添加的 `magpie-auto` 和压缩开关应先从用户 patch 中移除，避免重复挂载。
+v0.4.0 声明了原生 `dsh.bundle`，安装后自动挂载插件并停用 `compaction-basic`，无需手写 `insert`。卸载时先移除 profile 中自定义的 `magpie-auto` 覆盖条目，再运行 `dsh plugin --profile auto remove dsh-auto`，会移除该层并恢复原生压缩。旧版手工添加的 `magpie-auto` 和压缩开关应先从用户 patch 中移除，避免重复挂载。
 
 执行模型连接仍需配置。服务器 `auto/cordis.patch.yml` 将 `settings` 指向同目录的 `settings.yaml`，其中选择 `deepseek-official` 适配器、`dsh-workbuddy/deepseek-v4.1-flash` 模型和 `http://127.0.0.1:3435/v1` 网关。该 profile 的 `.credentials.yaml` 仅存本机网关所需的非秘密占位值，不含上游账号或 Console 密钥。
 

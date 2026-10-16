@@ -1,5 +1,3 @@
-// Conservative byte budget for Jev's documented 32k state + longest-question
-// limit. This is a transport bound, not a token or billing measurement.
 export const STATE_BYTES = 24000;
 import {contextQuestions} from './routing.js';
 const size = value => Buffer.byteLength(JSON.stringify(value));
@@ -25,8 +23,6 @@ export function selectionBatches(task, history, observation={}) {
       batch.history.push(unit); sources.set(unit.id, unit.id);
       continue;
     }
-    // Judge every part of an oversized source. Any retained part keeps the
-    // WHOLE original source in the execution history; its tail is never lost.
     flush();
     const characters = Array.from(unit.text);
     let offset = 0, part = 0;
