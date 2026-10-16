@@ -1,3 +1,5 @@
+// Jev evaluates independent facts. These rules compose them with explicit
+// deployment limits; neither a preference score nor confidence is a quality guarantee.
 export const RELEVANCE = ['Unrelated or superseded evidence.', 'Potentially useful but not necessary evidence.', 'Concrete evidence needed for the remaining assignment.'];
 const score = (instructions, criteria) => ({type:'score',instructions,criteria});
 

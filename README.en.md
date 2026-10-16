@@ -2,6 +2,8 @@
 
 Standalone Jev usage for the `dsh-auto` plugin. See [README.md](README.md) for the full Chinese documentation.
 
+Requires dsh `0.1.5-rc.1` or `0.2.x` (standalone mode verified on `0.2.0-rc.2`).
+
 ## Standalone
 
 The plugin can call Jev directly and no longer needs a local Magpie server: with `apiKey` set it uses the direct Jev endpoint, and only with `endpoint` set does it fall back to Magpie. Magpie is optional.

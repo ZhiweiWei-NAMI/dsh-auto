@@ -2,7 +2,7 @@
 
 dsh 的 Auto 决策插件。可以使用自己的 API Key 直连 `jev-1.13-free`，也可以通过 Magpie 获取结构化决策；插件通过 dsh 原生会话、工具和子代理接口落实决策。主代理和子代理使用配置的执行模型。插件不包含智能体执行运行时。
 
-需要 dsh `0.1.5-rc.1`。Magpie 是可选的；通过 Magpie 使用时，需要本 fork 的 Magpie Auto 决策接口。
+需要 dsh `0.1.5-rc.1` 或 `0.2.x`（已在 `0.2.0-rc.2` 上实测独立直连）。Magpie 是可选的；通过 Magpie 使用时，需要本 fork 的 Magpie Auto 决策接口。
 
 ## 独立使用
 

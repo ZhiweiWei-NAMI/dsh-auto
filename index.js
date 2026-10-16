@@ -131,6 +131,8 @@ export function apply(ctx,config) {
       roots.set(id,state);record({kind:'policy_snapshot',session:id,mode:state.mode,policy});return state;
     }
     for (const route of snapshot.routes) {
+      // Native preparation validates actual client-side routes and supported effort names.
+      // An omitted/empty effort list explicitly requests the native default.
       const efforts=route.efforts??[];
       for (const effort of efforts.length?efforts:[undefined]) {
         const options={provider:agent.options.provider,model:route.model,...effort===undefined?{}:{reasoningEffort:effort}};
@@ -211,6 +213,7 @@ export function apply(ctx,config) {
     const children=knownChildren.filter(x=>x.mode==='continuable' && !active.has(x.id));
     const recent=[...parent.session.surface.nodes].slice(-4).flatMap(seq=>{
       const message=parent.session.deriveEventMessage(parent.session.eventAt(seq));
+      // A requested tool call is an intention, not evidence of completed or assigned work.
       return message?message.content.filter(block=>block.type!=='reasoning' && block.type!=='tool-call').map((block,i)=>({id:'event_'+seq+'_evidence_'+i,kind:message.role+'/'+block.type,text:JSON.stringify(block)})):[];
     }).slice(-3);
     const request={task:tasks.get(parent.session.id),trigger:'delegation',history:[],
@@ -292,6 +295,8 @@ export function apply(ctx,config) {
       if(args.agent_id===rootOf(agent) && ((turnRequests.get(agent.session.id)??0)>=config.maxChildTurnRequests || budget(rootOf(agent)).childRequests>=config.maxChildRequests)){
         const run=active.get(agent.session.id);
         if(run)reports.set(run.runId,args.message);
+        // The real native message has been accepted. Conclude this budgeted
+        // reporting turn through the tool runtime, without an extra model call.
         exec.concludeTurn();
         record({kind:'child_budget_report',session:agent.session.id,runId:run?.runId});
       }
@@ -397,6 +402,8 @@ export function apply(ctx,config) {
       const required=message.role==='system'||message.source.kind==='user'||
         (agent.session.header.parentSession!==undefined && message.source.kind==='agent-message' && message.source.senderSessionId===rootOf(agent));
       if(required)return [{id:'event_'+seq,kind:message.role,text:JSON.stringify(message),required:true}];
+      // Logical blocks keep final evidence separate from speculative reasoning.
+      // Every block is complete; the original full messages stay in the journal.
       return message.content.map((block,i)=>({id:'event_'+seq+'_block_'+i,kind:message.role+'/'+block.type,text:JSON.stringify(block),required:false}));
     });
     const history=units(region);
