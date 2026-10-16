@@ -11,7 +11,7 @@ import {toolPairingBalancedBefore,toolPairingBalancedAfter} from '@deepseek-ai/d
 import {scoreContext,selectionBatches,extendTask,STATE_BYTES} from './decisions.js';
 import {delegationQuestions,selectDelegation,validateJevAnswers} from './routing.js';
 
-export const name='magpie-auto';
+export const name='dsh-auto';
 export const inject=['llm','tokenMeter','sessions','subagents','tools','agents','storageDomain'];
 export const Config=z.object({
   mode:z.union(['auto','single','native']).default('auto'),
@@ -35,7 +35,6 @@ export const Config=z.object({
     }).default({quality:0.8,latency:0.5,usage:0.5,cache:0.8}),
     routeWeights:z.dict(z.any()).default({}),
   }),
-  endpoint:z.string().default('http://127.0.0.1:3435/v1/auto/decide'),
   maxChildren:z.number().step(1).min(0).default(2),
   maxConcurrent:z.number().step(1).min(1).default(2),
   maxChildRequests:z.number().step(1).min(1).default(16),
@@ -58,6 +57,8 @@ const boundedEvidence=units=>{
   }
   return {currentEvidence,recentEvidenceOutsideBudget};
 };
+// Auto needs at least one route; the session's configured native model is the safe default.
+export const buildDefaultRoute=options=>({id:'default',label:'Default',model:options.model,provider:options.provider,description:'Main model',efforts:[]});
 
 export function apply(ctx,config) {
   const roots=new Map(),tasks=new Map(),budgets=new Map(),assignments=new Map();
@@ -73,7 +74,7 @@ export function apply(ctx,config) {
   const record=value=>{
     if (config.recordFile) fs.appendFileSync(config.recordFile,JSON.stringify({at:new Date().toISOString(),...value})+'\n',{mode:0o600});
   };
-  const modeOf=agent=>config.mode==='auto' ? roots.get(rootOf(agent))?.mode : config.mode;
+  const modeOf=agent=>!config.apiKey ? 'native' : config.mode==='auto' ? roots.get(rootOf(agent))?.mode : config.mode;
   let storePromise;
   const storage=()=>storePromise??=ctx.storageDomain.open(defineDomain({name:'dsh_auto',version:1,layout:'per-record',
     tables:{policies:domainTable(schema.json()),assignments:domainTable(schema.json())}}));
@@ -84,43 +85,34 @@ export function apply(ctx,config) {
     if (state.decisions>=config.maxDecisions) throw new Error('Jev task decision budget exhausted.');
     state.decisions++;
     const started=performance.now();
-    if (config.apiKey) {
-      const {questions,...decisionState}=request;
-      const response=await fetch(config.jevEndpoint,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+config.apiKey},
-        body:JSON.stringify({model:config.jevModel,state:JSON.stringify(decisionState),questions}),signal});
-      const bodyText=redact(await response.text(),config.apiKey);
-      if (!response.ok) throw new Error(`Jev decision failed (HTTP ${response.status}): ${bodyText}`);
-      let result;
-      try { result=JSON.parse(bodyText); } catch {
-        throw new Error(`Jev decision returned invalid JSON (HTTP ${response.status}): ${bodyText}`);
-      }
-      const problem=validateJevAnswers(questions,result?.answers);
-      if (problem) throw new Error(`Jev decision returned an invalid answer (HTTP ${response.status}): ${problem}. ${bodyText}`);
-      record({kind:'jev',session:agent.session.id,trigger:request.trigger,httpStatus:response.status,wallMs:performance.now()-started,...result});
-      return result;
+    const {questions,...decisionState}=request;
+    const response=await fetch(config.jevEndpoint,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+config.apiKey},
+      body:JSON.stringify({model:config.jevModel,state:JSON.stringify(decisionState),questions}),signal});
+    const bodyText=redact(await response.text(),config.apiKey);
+    if (!response.ok) throw new Error(`Jev decision failed (HTTP ${response.status}): ${bodyText}`);
+    let result;
+    try { result=JSON.parse(bodyText); } catch {
+      throw new Error(`Jev decision returned invalid JSON (HTTP ${response.status}): ${bodyText}`);
     }
-    const response=await fetch(config.endpoint,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer magpie'},
-      body:JSON.stringify({sessionId:agent.session.id,...request}),signal});
-    const result=await response.json();
+    const problem=validateJevAnswers(questions,result?.answers);
+    if (problem) throw new Error(`Jev decision returned an invalid answer (HTTP ${response.status}): ${problem}. ${bodyText}`);
     record({kind:'jev',session:agent.session.id,trigger:request.trigger,httpStatus:response.status,wallMs:performance.now()-started,...result});
-    if (!response.ok) throw new Error(`Magpie Jev decision failed (HTTP ${response.status}): ${JSON.stringify(result.error ?? result)}`);
     return result;
   }
 
   async function initialize(agent,signal) {
     const id=agent.session.id;
+    if (!config.apiKey || config.mode!=='auto') {
+      const state={mode:config.apiKey?config.mode:'native',profiles:[]};
+      roots.set(id,state);
+      record({kind:'policy_snapshot',session:id,mode:state.mode,...config.apiKey?{}:{reason:'no-api-key'}});
+      return state;
+    }
     const policies=(await storage()).table('policies');
     let snapshot=policies.get(id);
     if (!snapshot) {
-      if (config.apiKey) {
-        snapshot={enabled:true,routes:config.routes,
-          strategy:config.strategy ?? {mode:'automatic',weights:{quality:0.8,latency:0.5,usage:0.5,cache:0.8}}};
-      } else {
-        const response=await fetch(config.endpoint.replace(/\/decide$/,'/policy'),{headers:{Authorization:'Bearer magpie'},signal});
-        if (!response.ok) throw new Error(`Auto policy unavailable (HTTP ${response.status}).`);
-        snapshot=await response.json();
-      }
-      if (!snapshot.enabled || !Array.isArray(snapshot.routes)) throw new Error('Auto policy is disabled or malformed.');
+      snapshot={routes:config.routes.length?config.routes:[buildDefaultRoute(agent.options)],
+        strategy:config.strategy ?? {mode:'automatic',weights:{quality:0.8,latency:0.5,usage:0.5,cache:0.8}}};
       await policies.put(id,snapshot);
     }
     const policy=snapshot.strategy;
@@ -337,7 +329,7 @@ export function apply(ctx,config) {
       if(isChild)for(const message of messages)if(message.source.kind==='agent-message' && message.source.senderSessionId===rootOf(agent))
         tasks.set(id,tasks.get(id)+'\n\nFollow-up assignment:\n'+text(message));
     }
-    if (!isChild && config.mode==='auto' && !roots.has(id)) {
+    if (!isChild && !roots.has(id)) {
       const state=await initialize(agent,signal);
       if (state.mode==='auto') installRouting(agent);
       return next();

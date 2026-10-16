@@ -12,8 +12,8 @@ const answerProblem=(question,answer)=>{
   return null;
 };
 
-// Direct Jev callers must validate the primitive fields they read, exactly as the
-// Magpie gateway did, rather than letting undefined values change a decision.
+// Direct Jev callers must validate the primitive fields they read, rather than
+// letting undefined values change a decision.
 export function validateJevAnswers(questions,answers) {
   for (const [id,question] of Object.entries(questions ?? {})) {
     const problem=answerProblem(question,answers?.[id]);

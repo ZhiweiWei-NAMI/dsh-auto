@@ -1,25 +1,25 @@
 # dsh-auto
 
-dsh 的 Auto 决策插件。可以使用自己的 API Key 直连 `jev-1.13-free`，也可以通过 Magpie 获取结构化决策；插件通过 dsh 原生会话、工具和子代理接口落实决策。主代理和子代理使用配置的执行模型。插件不包含智能体执行运行时。
+dsh 的 Auto 决策插件。填写自己的 API Key 后直连 `jev-1.13-free` 获取结构化决策，插件通过 dsh 原生会话、工具和子代理接口落实决策。主代理和子代理使用配置的执行模型。插件不包含智能体执行运行时。未配置 `apiKey` 时按原生模式运行，不调用任何网络服务。
 
-需要 dsh `0.1.5-rc.1` 或 `0.2.x`（已在 `0.2.0-rc.2` 上实测独立直连）。Magpie 是可选的；通过 Magpie 使用时，需要本 fork 的 Magpie Auto 决策接口。
+需要 dsh `0.1.5-rc.1` 或 `0.2.x`（已在 `0.2.0-rc.2` 上实测）。
 
-## 独立使用
+## 安装
 
-插件可以直连 Jev，不再依赖本机 Magpie：配置了 `apiKey` 就走直连，只配置 `endpoint` 才走 Magpie。Magpie 是可选的。
+插件直连 Jev，不依赖其他网关：配置了 `apiKey` 就走直连，未配置时按原生模式运行。
 
 ```bash
 # 新建 profile，然后从 GitHub 或 npm 安装
 dsh --profile auto --from-default-profile headless --dump-config >/dev/null
-dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto#v0.4.0
+dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto#v0.5.0
 # 或 npm 包 dsh-auto
 dsh plugin --profile auto add dsh-auto
 ```
 
-在 profile 自己的 `cordis.patch.yml` 里给 `magpie-auto` 填最小配置。`apiKey` 到 <https://opencode.ai> 的 workspace API Keys 页面获取：
+在 profile 自己的 `cordis.patch.yml` 里给 `dsh-auto` 填最小配置。`apiKey` 到 <https://opencode.ai> 的 workspace API Keys 页面获取：
 
 ```yaml
-- id: magpie-auto
+- id: dsh-auto
   config:
     apiKey: <你的 opencode workspace key>
     routes:
@@ -35,9 +35,13 @@ dsh plugin --profile auto add dsh-auto
         efforts: [high]
 ```
 
-`routes` 是允许使用的角色、模型和 effort，执行模型连接仍由 `settings.yaml` 决定。省略 `strategy` 时使用 `automatic` 模式和默认权重 `{quality: 0.8, latency: 0.5, usage: 0.5, cache: 0.8}`；`mode: single` / `native` 分别固定单代理和原生压缩。`apiKey` 声明为 secret，不会写入日志或记录文件。
+`routes` 是允许使用的角色、模型和 effort，执行模型连接仍由 `settings.yaml` 决定。省略 `routes` 时自动使用当前会话的原生模型作为唯一默认路由。省略 `strategy` 时使用 `automatic` 模式和默认权重 `{quality: 0.8, latency: 0.5, usage: 0.5, cache: 0.8}`；`mode: single` / `native` 分别固定单代理和原生压缩。`apiKey` 声明为 secret，不会写入日志或记录文件。
 
-保留下面的 Magpie 用法：`apiKey` 未设置且 `endpoint` 指向本机 Magpie 时，策略快照仍从 Magpie 的 `/policy` 读取。
+未设置 `apiKey` 时不访问任何网络服务：会话按原生模式运行（等同 `strategy.mode: native`），并记录一条 `reason: 'no-api-key'` 的 `policy_snapshot`，不会抛错。
+
+### 从 0.4.x 升级
+
+profile 覆盖里的 `magpie-auto` 需改名为 `dsh-auto`；`endpoint` 字段已删除，应一并移除。
 
 ## 启用
 
@@ -57,19 +61,18 @@ dsh --profile auto --patch "$DSH_HOME/profiles/auto/node_modules/dsh-auto/off.pa
 
 ```bash
 dsh --profile auto --from-default-profile headless --dump-config >/dev/null
-dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto#v0.4.0
+dsh plugin --profile auto add github:ZhiweiWei-NAMI/dsh-auto#v0.5.0
 ```
 
-v0.4.0 声明了原生 `dsh.bundle`，安装后自动挂载插件并停用 `compaction-basic`，无需手写 `insert`。卸载时先移除 profile 中自定义的 `magpie-auto` 覆盖条目，再运行 `dsh plugin --profile auto remove dsh-auto`，会移除该层并恢复原生压缩。旧版手工添加的 `magpie-auto` 和压缩开关应先从用户 patch 中移除，避免重复挂载。
+v0.5.0 声明了原生 `dsh.bundle`，安装后自动挂载插件并停用 `compaction-basic`，无需手写 `insert`。卸载时先移除 profile 中自定义的 `dsh-auto` 覆盖条目，再运行 `dsh plugin --profile auto remove dsh-auto`，会移除该层并恢复原生压缩。旧版手工添加的插件和压缩开关应先从用户 patch 中移除，避免重复挂载。
 
 执行模型连接仍需配置。服务器 `auto/cordis.patch.yml` 将 `settings` 指向同目录的 `settings.yaml`，其中选择 `deepseek-official` 适配器、`dsh-workbuddy/deepseek-v4.1-flash` 模型和 `http://127.0.0.1:3435/v1` 网关。该 profile 的 `.credentials.yaml` 仅存本机网关所需的非秘密占位值，不含上游账号或 Console 密钥。
 
 需要覆盖插件限制时，在 **profile 自己的** `$DSH_HOME/profiles/auto/cordis.patch.yml` 增加：
 
 ```yaml
-- id: magpie-auto
+- id: dsh-auto
   config:
-    endpoint: http://127.0.0.1:3435/v1/auto/decide
     maxChildren: 2
     maxConcurrent: 2
     maxChildRequests: 16
@@ -79,7 +82,7 @@ v0.4.0 声明了原生 `dsh.bundle`，安装后自动挂载插件并停用 `comp
     retainTokens: 8000
 ```
 
-Magpie 的 Auto 配置指定 `decider: jev-1.13-free` 和 Console 密钥文件的绝对路径。密钥只由服务器读取，dsh 不接收 Console 密钥。执行模型连接仍使用已有 Magpie 网关和 dsh-workbuddy 服务。
+Jev 决策在插件内直接调用，不再经过外部网关。执行模型连接使用 `settings.yaml` 中已有的 dsh 连接和 dsh-workbuddy 服务。
 
 本机 Auto 的模型连接和默认执行模型位于 `$DSH_HOME/profiles/auto/settings.yaml`；插件限制位于同目录 `cordis.patch.yml`。不要写进 home 级 patch，以免影响其他 profile。`recordFile` 可指定一个已存在、可写目录中的 JSONL 文件，记录模型用量和原生子代理生命周期。
 
@@ -89,7 +92,7 @@ Magpie 的 Auto 配置指定 `decider: jev-1.13-free` 和 Console 密钥文件�
 
 决策证据排除尚未执行的工具调用，并明确当前提案尚未分配。Jev 拒绝后，主代理应继续工作；取得新的工具结果或用户/子代理消息前，改写提案不会重复调用 Jev。
 
-在 Magpie 控制台的策略输入框，可以输入例如“自动决策，优先正确性和缓存，偏好实现代理，只在独立子任务有明确收益时协作”。Magpie 用一次真实 Jev 调用生成模式和初始偏好；相同指令与路由再次保存不重复调用。新会话读取并固定策略，已有会话不随全局编辑漂移。策略存入 dsh 原生 storage domain：`$DSH_HOME/storages/dsh_auto/`；模型历史仍由原生 session 管理，不向事件日志写入 SDK 不认识的事件类型。
+策略完全来自本地配置（`routes` + `strategy`），新会话创建时固定，已有会话不随全局编辑漂移。策略存入 dsh 原生 storage domain：`$DSH_HOME/storages/dsh_auto/`；模型历史仍由原生 session 管理，不向事件日志写入 SDK 不认识的事件类型。
 
 `routes` 是允许使用的角色、模型和 effort。插件用 dsh 的连接准备接口检查候选配置；主代理默认模型仍由 `settings.yaml` 设置。当前服务器只实测 `deepseek-v4.1-flash` + `high`，不能据此声称跨模型路由提高了质量。策略权重是用户偏好，不是模型成功概率。
 
@@ -107,7 +110,7 @@ Magpie 的 Auto 配置指定 `decider: jev-1.13-free` 和 Console 密钥文件�
 
 `mode: single` 禁止原生子代理调用，供单代理对照实验使用。单代理模式同样需要启用原生 `compaction-basic`。
 
-也可以在 Magpie 策略框明确要求固定单代理或原生调度：`mode: auto` 插件读取该快照后采用原生压缩，任务中不调用 Jev；首次编译配置的 Jev 调用仍需单独计入。它与直接设定插件的 `single` / `native` 模式是两种入口。
+也可以直接设定插件的 `mode` 来固定单代理或原生调度：`mode: native` 采用原生压缩，任务中不调用 Jev。它与 `strategy.mode` 的 `single` / `native` 是不同层级的入口。
 
 ## 验证
 
@@ -125,4 +128,4 @@ v0.3.1 已从 GitHub 安装到本机原生 `auto` profile，完成真实代码�
 
 修复前的补测发生 12 次拒绝且没有创建子代理；修复后同一职责流程由 Jev 选择创建并成功回收，拒绝记录没有删除。另一次安装失败后误用旧版本的探针被中断，也单列保留。没有据此宣称整体性能提高；账单字段未提供，不计算费用。
 
-此前 v0.3.0 已验证同一原生子代理的两次激活及 Jev 上下文替换，见[修订记录](https://github.com/ZhiweiWei-NAMI/magpie-auto/tree/feature/auto-workspace/experiments/jev-routing-revision)。旧 v0.2.2 的十二题 SWE-bench Verified 官方解决率为 Auto 6/12、单代理与原生可选协作各 8/12，见[完整实验](https://github.com/ZhiweiWei-NAMI/magpie-auto/tree/feature/auto-workspace/experiments/jev-cache-20261012)。未证明 Auto 普遍优于原生 dsh；共享 WorkBuddy 仍轮换账号，缓存抖动尚未全部解决。
+此前 v0.3.0 已验证同一原生子代理的两次激活及 Jev 上下文替换。旧 v0.2.2 的十二题 SWE-bench Verified 官方解决率为 Auto 6/12、单代理与原生可选协作各 8/12。未证明 Auto 普遍优于原生 dsh；共享 WorkBuddy 仍轮换账号，缓存抖动尚未全部解决。

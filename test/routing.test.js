@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {selectDelegation,validateJevAnswers} from '../routing.js';
+import {buildDefaultRoute} from '../index.js';
 const profiles=[{id:'general/high',routeId:'general'},{id:'review/high',routeId:'review'}];
 const answer={independent:{noul:0.95},useful:{score:1.9,confidence:0.9},fit_0:{score:1.8,confidence:0.8},fit_1:{score:1.8,confidence:0.8}};
 const weights={quality:1,latency:0.5,usage:0.5,cache:1};
@@ -14,6 +15,10 @@ test('configured initial preferences affect the chosen eligible native profile',
 test('an explicitly invalid route preference is a configuration error, not a default',()=>{
   for (const routeWeights of [{general:'high'},{general:-0.1},{general:1.5},{general:null}])
     assert.throws(()=>selectDelegation(answer,profiles,[],{weights,routeWeights},{canCreate:true}),/routeWeights\.general/);
+});
+test('an empty route list falls back to the session native model',()=>{
+  assert.deepEqual(buildDefaultRoute({provider:'deepseek-official',model:'deepseek-v4.1-flash'}),
+    {id:'default',label:'Default',provider:'deepseek-official',model:'deepseek-v4.1-flash',description:'Main model',efforts:[]});
 });
 test('direct Jev answers require valid primitive fields',()=>{
   const questions={useful:{type:'score',criteria:['a','b','c']},independent:{type:'noul'},
