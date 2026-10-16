@@ -18,7 +18,7 @@ test('an explicitly invalid route preference is a configuration error, not a def
 });
 test('an empty route list falls back to the session native model',()=>{
   assert.deepEqual(buildDefaultRoute({provider:'deepseek-official',model:'deepseek-v4.1-flash'}),
-    {id:'default',label:'Default',provider:'deepseek-official',model:'deepseek-v4.1-flash',description:'Main model',efforts:[]});
+    {id:'default',label:'Default',provider:'deepseek-official',model:'deepseek-v4.1-flash',description:'General implementation, analysis and verification with the session main model',efforts:[]});
 });
 test('direct Jev answers require valid primitive fields',()=>{
   const questions={useful:{type:'score',criteria:['a','b','c']},independent:{type:'noul'},

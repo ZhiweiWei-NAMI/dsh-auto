@@ -58,7 +58,7 @@ const boundedEvidence=units=>{
   return {currentEvidence,recentEvidenceOutsideBudget};
 };
 // Auto needs at least one route; the session's configured native model is the safe default.
-export const buildDefaultRoute=options=>({id:'default',label:'Default',model:options.model,provider:options.provider,description:'Main model',efforts:[]});
+export const buildDefaultRoute=options=>({id:'default',label:'Default',model:options.model,provider:options.provider,description:'General implementation, analysis and verification with the session main model',efforts:[]});
 
 export function apply(ctx,config) {
   const roots=new Map(),tasks=new Map(),budgets=new Map(),assignments=new Map();
