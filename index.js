@@ -9,7 +9,7 @@ import {createUserMessage} from '@deepseek-ai/dsh-llm';
 import {validateJsonSchemaValue,ToolArgsError} from '@deepseek-ai/dsh-tools';
 import {toolPairingBalancedBefore,toolPairingBalancedAfter} from '@deepseek-ai/dsh-compaction';
 import {scoreContext,selectionBatches,extendTask,STATE_BYTES} from './decisions.js';
-import {delegationQuestions,selectDelegation} from './routing.js';
+import {delegationQuestions,selectDelegation,validateJevAnswers} from './routing.js';
 
 export const name='magpie-auto';
 export const inject=['llm','tokenMeter','sessions','subagents','tools','agents','storageDomain'];
@@ -94,6 +94,8 @@ export function apply(ctx,config) {
       try { result=JSON.parse(bodyText); } catch {
         throw new Error(`Jev decision returned invalid JSON (HTTP ${response.status}): ${bodyText}`);
       }
+      const problem=validateJevAnswers(questions,result?.answers);
+      if (problem) throw new Error(`Jev decision returned an invalid answer (HTTP ${response.status}): ${problem}. ${bodyText}`);
       record({kind:'jev',session:agent.session.id,trigger:request.trigger,httpStatus:response.status,wallMs:performance.now()-started,...result});
       return result;
     }

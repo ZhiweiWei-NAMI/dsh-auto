@@ -2,6 +2,25 @@
 // deployment limits; neither a preference score nor confidence is a quality guarantee.
 export const RELEVANCE = ['Unrelated or superseded evidence.', 'Potentially useful but not necessary evidence.', 'Concrete evidence needed for the remaining assignment.'];
 const score = (instructions, criteria) => ({type:'score',instructions,criteria});
+const finiteInRange=(value,max)=>typeof value==='number' && Number.isFinite(value) && value>=0 && value<=max;
+const answerProblem=(question,answer)=>{
+  if (!answer || typeof answer!=='object' || answer.type!==question.type) return 'missing or mismatched primitive answer';
+  if (question.type==='noul') return finiteInRange(answer.noul,1) ? null : 'missing or invalid noul';
+  if (question.type==='score' && !finiteInRange(answer.score,question.criteria.length-1)) return 'missing or invalid score';
+  if (question.type==='choice' && (typeof answer.choice!=='string' || !Object.hasOwn(question.criteria,answer.choice))) return 'choice was not offered';
+  if ((question.type==='score' || question.type==='choice') && !finiteInRange(answer.confidence,1)) return 'missing or invalid confidence';
+  return null;
+};
+
+// Direct Jev callers must validate the primitive fields they read, exactly as the
+// Magpie gateway did, rather than letting undefined values change a decision.
+export function validateJevAnswers(questions,answers) {
+  for (const [id,question] of Object.entries(questions ?? {})) {
+    const problem=answerProblem(question,answers?.[id]);
+    if (problem) return id+': '+problem;
+  }
+  return null;
+}
 
 export function delegationQuestions(profiles, children) {
   const questions = {
@@ -22,6 +41,11 @@ export function selectDelegation(answers, profiles, children, policy, limits) {
   const weights=policy?.weights ?? {quality:0.5,latency:0.5,usage:0.5,cache:0.5};
   const usefulThreshold=1.2+0.2*weights.usage+0.2*weights.latency;
   const confidenceThreshold=0.4+0.2*weights.quality;
+  const routeWeights=policy?.routeWeights ?? {};
+  for (const [routeId,preference] of Object.entries(routeWeights)) {
+    if (!finiteInRange(preference,1))
+      throw new Error('routeWeights.'+routeId+' must be a number between 0 and 1.');
+  }
   if (answers.useful.score < usefulThreshold || answers.useful.confidence < confidenceThreshold)
     return {action:'main',reason:'The proposal lacks a sufficiently clear unfinished deliverable.'};
   const reuse=children.map((child,i)=>({child,answer:answers['reuse_'+i]}))
@@ -33,8 +57,7 @@ export function selectDelegation(answers, profiles, children, policy, limits) {
   if (!limits.canCreate) return {action:'main',reason:'The task has no remaining child slot; continue in the parent or explicitly message an existing child.'};
   const ranked=profiles.map((profile,i)=>{
     const fit=answers['fit_'+i];
-    const preference=policy?.routeWeights?.[profile.routeId];
-    const prior=Number.isFinite(preference) && preference>=0 && preference<=1 ? preference : 0.5;
+    const prior=Object.hasOwn(routeWeights,profile.routeId) ? routeWeights[profile.routeId] : 0.5;
     return {profile,fit,weight:fit.score*(0.75+prior/2)};
   }).filter(x=>x.fit.confidence>=confidenceThreshold && x.fit.score>=1.25)
     .sort((a,b)=>b.weight-a.weight || a.profile.id.localeCompare(b.profile.id));
