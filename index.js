@@ -111,7 +111,7 @@ export function apply(ctx,config) {
     const policies=(await storage()).table('policies');
     let snapshot=policies.get(id);
     if (!snapshot) {
-      snapshot={routes:config.routes.length?config.routes:[buildDefaultRoute(agent.options)],
+      snapshot={routes:config.routes,
         strategy:config.strategy ?? {mode:'automatic',weights:{quality:0.8,latency:0.5,usage:0.5,cache:0.8}}};
       await policies.put(id,snapshot);
     }
@@ -124,7 +124,8 @@ export function apply(ctx,config) {
     if(state.mode!=='auto'){
       roots.set(id,state);record({kind:'policy_snapshot',session:id,mode:state.mode,policy});return state;
     }
-    for (const route of snapshot.routes) {
+    // The generated default route is never persisted, so it always follows the session's current model.
+    for (const route of snapshot.routes.length?snapshot.routes:[buildDefaultRoute(agent.options)]) {
       // Native preparation validates actual client-side routes and supported effort names.
       // An omitted/empty effort list explicitly requests the native default.
       const efforts=route.efforts??[];
